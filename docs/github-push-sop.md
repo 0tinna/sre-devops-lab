@@ -1,51 +1,51 @@
-# GitHub push SOP
+# GitHub 推送 SOP
 
-Repository: https://github.com/0tinna/sre-devops-lab
+仓库地址：https://github.com/0tinna/sre-devops-lab
 
-Master working copy: `/opt/sre-devops-lab`
+master 工作目录：`/opt/sre-devops-lab`
 
-Deployment key on master: `/root/.ssh/github_sre_lab_ed25519`
+部署密钥私钥路径：`/root/.ssh/github_sre_lab_ed25519`
 
-The private key stays on the master node. Only the public key below is safe to paste into GitHub.
+私钥只保留在 master 节点。下面的公钥可以安全地粘贴到 GitHub。
 
-## 1. Add the deploy key with write access
+## 1. 添加具有写权限的部署密钥
 
-1. Open https://github.com/0tinna/sre-devops-lab/settings/keys
-2. Click `Add deploy key`.
-3. Title: `sre-lab-master`
-4. Key:
+1. 打开 https://github.com/0tinna/sre-devops-lab/settings/keys
+2. 点击 `Add deploy key`。
+3. Title 填写：`sre-lab-master`
+4. Key 填入：
 
 ```text
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINGBoz2mz3enY7/WJwWQ5WdQs3ZwlLQJD2yWdWRKBbXk sre-lab-master
 ```
 
-5. Check `Allow write access`.
-6. Click `Add key`.
+5. 勾选 `Allow write access`。
+6. 点击 `Add key`。
 
-If write access is not checked, `git push` will fail with `Permission denied (publickey)` or a read-only error.
+如果没有勾选写权限，`git push` 会失败，常见报错是 `Permission denied (publickey)` 或只读权限错误。
 
-## 2. Verify authentication from master
+## 2. 在 master 上验证认证
 
-Run on master:
+在 master 执行：
 
 ```bash
 ssh -i /root/.ssh/github_sre_lab_ed25519 -o IdentitiesOnly=yes -T git@github.com
 ```
 
-Expected result is similar to:
+预期输出类似：
 
 ```text
 Hi 0tinna/sre-devops-lab! You've successfully authenticated, but GitHub does not provide shell access.
 ```
 
-Common failures:
+常见失败：
 
-- `Permission denied (publickey)`: the public key was not added, the wrong key was added, or write access is unchecked.
-- `Repository not found`: check the repository URL and whether the deploy key belongs to the correct repository.
+- `Permission denied (publickey)`：公钥没有添加、添加了错误的公钥，或者没有勾选写权限。
+- `Repository not found`：检查仓库地址，以及部署密钥是否添加到了正确仓库。
 
-## 3. Push the first commit
+## 3. 推送第一个提交
 
-The repository is already initialized, committed and configured on master:
+master 上已经完成仓库初始化、提交和远程配置：
 
 ```bash
 cd /opt/sre-devops-lab
@@ -53,67 +53,67 @@ git status
 git push -u origin main
 ```
 
-Expected result:
+预期结果：
 
 ```text
 branch 'main' set up to track 'origin/main'
 ```
 
-Do not use `git push --force` if the remote already has commits. Inspect the remote first:
+如果远程已经有提交，不要直接使用 `git push --force`。先检查：
 
 ```bash
 git ls-remote origin
 git log --oneline --decorate -3
 ```
 
-If the remote has a README commit, use a normal merge or rebase instead of force push.
+如果远程有 README 等初始提交，应使用普通 merge 或 rebase，而不是强制推送。
 
-## 4. Verify GitHub Actions
+## 4. 检查 GitHub Actions
 
-1. Open https://github.com/0tinna/sre-devops-lab/actions
-2. Open the `ci` workflow.
-3. Confirm the `validate` job is green.
-4. Confirm the `image` job is green after a push to `main`.
-5. Confirm the package appears at https://github.com/0tinna?tab=packages
+1. 打开 https://github.com/0tinna/sre-devops-lab/actions
+2. 打开 `ci` workflow。
+3. 确认 `validate` job 通过。
+4. 确认推送到 `main` 后 `image` job 通过。
+5. 在 GitHub Packages 中确认镜像已生成。
 
-The workflow publishes:
+流水线会发布：
 
 ```text
 ghcr.io/0tinna/sre-devops-lab:latest
 ghcr.io/0tinna/sre-devops-lab:<commit-sha>
 ```
 
-The `image` job is intentionally skipped for pull requests.
+Pull Request 不会执行镜像发布 job，这是有意设计的。
 
-## 5. Make the image pullable by the cluster
+## 5. 让集群可以拉取镜像
 
-For the lab, the simplest option is to make the GHCR package public:
+实验环境最简单的方式是把 GHCR 包设为公开：
 
-1. Open the package page.
-2. Open `Package settings`.
-3. Change visibility to `Public`.
+1. 打开包页面。
+2. 进入 `Package settings`。
+3. 将可见性改为 `Public`。
 
-For a private package, create an image pull secret instead:
+如果必须使用私有包，则创建 imagePullSecret：
 
 ```bash
 kubectl -n sre-lab create secret docker-registry ghcr-secret \
   --docker-server=ghcr.io \
   --docker-username=0tinna \
-  --docker-password=<PAT-with-read-packages>
+  --docker-password=<具有 read:packages 权限的 PAT>
 ```
 
-Then add this to the Deployment pod template:
+然后在 Deployment 的 Pod 模板中加入：
 
 ```yaml
 imagePullSecrets:
   - name: ghcr-secret
 ```
 
-Do not commit the PAT to Git.
+不要把 PAT 提交到 Git。
 
-## 6. Deploy after the image exists
+## 6. 镜像生成后部署
 
-Run on master:
+在 master 执行：
 
 ```bash
 cd /opt/sre-devops-lab
@@ -125,7 +125,7 @@ kubectl -n sre-lab rollout status deployment/demo-api --timeout=120s
 kubectl -n sre-lab get pods -o wide
 ```
 
-Verify the service:
+验证服务：
 
 ```bash
 kubectl -n sre-lab port-forward svc/demo-api 8080:80
@@ -134,7 +134,7 @@ curl -i http://127.0.0.1:8080/readyz
 curl -s http://127.0.0.1:8080/metrics | head
 ```
 
-## 7. Troubleshooting checklist
+## 7. 排查清单
 
 ### ImagePullBackOff
 
@@ -144,9 +144,9 @@ kubectl -n sre-lab describe pod <pod-name>
 kubectl -n sre-lab get events --sort-by=.lastTimestamp
 ```
 
-Check image name, tag, package visibility, registry authentication, DNS and network.
+检查镜像名、标签、包可见性、仓库认证、DNS 和网络。
 
-### Rollout does not become ready
+### 发布后一直不 Ready
 
 ```bash
 kubectl -n sre-lab get deploy demo-api -o yaml
@@ -155,15 +155,15 @@ kubectl -n sre-lab describe pod <pod-name>
 kubectl -n sre-lab logs deploy/demo-api --tail=100
 ```
 
-Check readiness probe, resource limits and application startup logs.
+检查 readiness 探针、资源限制和应用启动日志。
 
-### Rollback
+### 回滚
 
 ```bash
 kubectl -n sre-lab rollout undo deployment/demo-api
 kubectl -n sre-lab rollout status deployment/demo-api --timeout=120s
 ```
 
-## 8. Interview explanation
+## 8. 面试表述
 
-I used a repository-scoped SSH deploy key rather than a personal password. The private key stays on the master node, and the public key is added to GitHub with write access. The first push triggers GitHub Actions, which validates the application and publishes a commit-tagged image to GHCR. The Kubernetes Deployment references the commit SHA, and I verify rollout status, pod health and the metrics endpoint after deployment.
+我使用仓库级 SSH 部署密钥，而不是个人账号密码。私钥只保留在 master 节点，公钥添加为 GitHub 仓库的写权限部署密钥。首次推送会触发 GitHub Actions，完成代码校验和单元测试，并把 commit SHA 作为镜像标签发布到 GHCR。Kubernetes Deployment 引用该 commit SHA，部署后我检查 rollout 状态、Pod 健康和 metrics 端点。
