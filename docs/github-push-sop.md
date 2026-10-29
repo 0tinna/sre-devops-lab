@@ -8,6 +8,22 @@ master 工作目录：`/opt/sre-devops-lab`
 
 私钥只保留在 master 节点。下面的公钥可以安全地粘贴到 GitHub。
 
+## 当前执行进度
+
+| 步骤 | 状态 | 执行者 | 说明 |
+| --- | --- | --- | --- |
+| 项目文件生成 | [x] | Codex | 已生成应用、Dockerfile、K8s 清单、CI、测试和文档 |
+| 项目传输到 master | [x] | Codex | 已解压到 `/opt/sre-devops-lab` |
+| Git 初始化与提交 | [x] | Codex | 当前 HEAD 为 `fe6440f` |
+| Git remote 配置 | [x] | Codex | 指向 `git@github.com:0tinna/sre-devops-lab.git` |
+| 部署密钥生成 | [x] | Codex | 私钥在 master，公钥在第 1 节 |
+| GitHub 添加部署密钥 | [ ] | 用户 | 必须勾选 Allow write access |
+| 首次 push | [ ] | Codex | 用户添加密钥后执行 |
+| GitHub Actions | [ ] | GitHub | push 后自动触发 |
+| GHCR 镜像 | [ ] | GitHub Actions | 构建成功后生成 |
+| Kubernetes 部署 | [ ] | Codex | 镜像生成后执行 |
+| Prometheus / Grafana | [ ] | Codex | 后续阶段 |
+
 ## 1. 添加具有写权限的部署密钥
 
 1. 打开 https://github.com/0tinna/sre-devops-lab/settings/keys
