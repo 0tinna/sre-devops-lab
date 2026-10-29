@@ -14,14 +14,15 @@ master 工作目录：`/opt/sre-devops-lab`
 | --- | --- | --- | --- |
 | 项目文件生成 | [x] | Codex | 已生成应用、Dockerfile、K8s 清单、CI、测试和文档 |
 | 项目传输到 master | [x] | Codex | 已解压到 `/opt/sre-devops-lab` |
-| Git 初始化与提交 | [x] | Codex | 当前 HEAD 为 `fe6440f` |
+| Git 初始化与提交 | [x] | Codex | 当前 HEAD 为 `03bea91` |
 | Git remote 配置 | [x] | Codex | 指向 `git@github.com:0tinna/sre-devops-lab.git` |
 | 部署密钥生成 | [x] | Codex | 私钥在 master，公钥在第 1 节 |
-| GitHub 添加部署密钥 | [ ] | 用户 | 必须勾选 Allow write access |
-| 首次 push | [ ] | Codex | 用户添加密钥后执行 |
-| GitHub Actions | [ ] | GitHub | push 后自动触发 |
-| GHCR 镜像 | [ ] | GitHub Actions | 构建成功后生成 |
-| Kubernetes 部署 | [ ] | Codex | 镜像生成后执行 |
+| GitHub 添加部署密钥 | [x] | 用户 | 已完成，Allow write access 已勾选 |
+| 首次 push | [x] | 用户 | origin/main = `03bea91` |
+| GitHub Actions | [x] | GitHub | run 40799208887，结论 success |
+| GHCR 镜像 | [x] | GitHub Actions | 已生成并已被节点拉取 |
+| Kubernetes 部署 | [x] | 用户 | 资源已创建，但 Pod 处于 CreateContainerConfigError |
+| 镜像数字 UID 修复 | [ ] | Codex | 待提交新 Dockerfile 和 K8s 配置 |
 | Prometheus / Grafana | [ ] | Codex | 后续阶段 |
 
 ## 1. 添加具有写权限的部署密钥
@@ -66,7 +67,7 @@ master 上已经完成仓库初始化、提交和远程配置：
 ```bash
 cd /opt/sre-devops-lab
 git status
-git push -u origin main
+git push -u origin main  # 这是push推送命令，首次需要-u永久指定分支main
 ```
 
 预期结果：
@@ -136,7 +137,8 @@ cd /opt/sre-devops-lab
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/app.yaml
 kubectl -n sre-lab set image deployment/demo-api \
-  demo-api=ghcr.io/0tinna/sre-devops-lab:<commit-sha>
+  demo-api=ghcr.io/0tinna/sre-devops-lab:03bea9199c5c9674684af0ee5cbb1f694ed2ece6
+# rollout status deployment/demo-api 检查deployment这个有状态负载是否正常更新滚动
 kubectl -n sre-lab rollout status deployment/demo-api --timeout=120s
 kubectl -n sre-lab get pods -o wide
 ```

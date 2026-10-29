@@ -15,18 +15,24 @@
 - 在 master 生成专用 GitHub 部署密钥。
 - 配置 Git remote 为 `git@github.com:0tinna/sre-devops-lab.git`。
 - 将全部 Markdown 文档改为中文。
+- 通过只读检查确认：push、GitHub Actions、GHCR 镜像拉取和 Deployment 创建均已发生。
 
-尚未执行的操作：
+用户后续执行的操作：
 
-- 没有在 GitHub 添加部署密钥。
-- 没有执行 `git push`。
-- 没有触发 GitHub Actions。
-- 没有生成 GHCR 镜像。
-- 没有创建或修改任何 Kubernetes 业务资源。
-- 没有安装 Helm、Prometheus、Grafana 或 Alertmanager。
-- 没有修改 kube-system、CNI、CoreDNS 或节点配置。
+- 在 GitHub 添加部署密钥，并完成首次 push。
+- GitHub Actions `ci` 由 push 自动触发，运行结果为 success。
+- GHCR 镜像已生成，并已被 node 节点拉取。
+- `sre-lab` 命名空间、Deployment 和 Service 已创建，但 Pod 启动失败。
 
-重要说明：本记录中的集群查询均为只读操作。到目前为止，集群业务状态没有被我改变。
+Codex 没有执行的操作：
+
+- Codex 没有执行 `git push`。
+- Codex 没有手动触发 GitHub Actions。
+- Codex 没有创建或修改 Kubernetes 业务资源。
+- Codex 没有安装 Helm、Prometheus、Grafana 或 Alertmanager。
+- Codex 没有修改 kube-system、CNI、CoreDNS 或节点配置。
+
+重要说明：Codex 侧的集群操作均为只读查询；当前 `sre-lab` 资源是用户侧操作产生的。镜像拉取已经成功，当前故障不是镜像拉取失败，而是容器启动配置错误。
 
 ## 状态图例
 
@@ -93,25 +99,48 @@
 | 30 | master | 执行 `git ls-remote https://github.com/0tinna/sre-devops-lab.git` | 成功，仓库为空 | 只读 |
 | 31 | master | 执行 `ssh -T git@github.com` | Permission denied，说明还没有可用 GitHub SSH 权限 | 只读 |
 | 32 | master | 生成 `/root/.ssh/github_sre_lab_ed25519` | 私钥和公钥已生成 | 写操作 |
-| 33 | GitHub 网页 | 添加 Deploy Key 并勾选 Allow write access | 尚未执行 | 待用户操作 |
-| 34 | master | `git push -u origin main` | 尚未执行 | 待执行 |
+| 33 | GitHub 网页 | 添加 Deploy Key 并勾选 Allow write access | 已完成，用户操作 | 写操作 |
+| 34 | master | `git push -u origin main` | 已完成，用户操作；origin/main 为 `03bea91` | 写操作 |
 
 ## 6. 尚未开始的部分
 
 | 项目 | 当前状态 | 说明 |
 | --- | --- | --- |
-| GitHub Actions 运行 | 待执行 | 需要先完成 push |
-| GHCR 镜像 | 未生成 | 依赖 GitHub Actions |
-| Kubernetes 业务部署 | 未执行 | 没有创建 `sre-lab` 资源 |
+| GitHub Actions 运行 | 已完成 | run 40799208887，结论 success |
+| GHCR 镜像 | 已生成 | `ghcr.io/0tinna/sre-devops-lab:03bea91...` 已被节点拉取 |
+| Kubernetes 业务部署 | 已创建但未就绪 | Pod 处于 `CreateContainerConfigError` |
+| 镜像数字 UID 修复 | 进行中 | Dockerfile 和 K8s securityContext 已改，待重新构建和发布 |
 | Prometheus / Grafana | 未安装 | 下一阶段 |
 | 告警规则 | 未配置 | 下一阶段 |
 | 故障演练 | 未执行 | 下一阶段 |
-| 面试项目最终演示 | 未完成 | 需要镜像和监控 |
+| 面试项目最终演示 | 未完成 | 需要先修复容器启动问题 |
+
+## 6.1 2026-10-29 容器启动故障
+
+观察到的现象：
+
+- Deployment 为 `0/2`。
+- Pod 状态为 `CreateContainerConfigError`。
+- Pod Events 中已经出现 `Pulled`，说明镜像拉取成功。
+- 关键错误：`container has runAsNonRoot and image has non-numeric user (app), cannot verify user is non-root`。
+
+根因：
+
+Dockerfile 中使用了 `USER app`，镜像配置里的 User 字段是字符串 `app`。Kubernetes 在 `runAsNonRoot: true` 时无法仅凭用户名证明 UID 不是 0，因此拒绝启动容器。
+
+修复：
+
+- Dockerfile 使用数字 UID/GID：`USER 10001:10001`。
+- Pod securityContext 增加 `runAsUser: 10001`、`runAsGroup: 10001`、`fsGroup: 10001`。
+- 需要重新提交、push、等待 GitHub Actions 构建新镜像，再滚动更新 Deployment。
+
+结论：这不是镜像拉取失败，也不需要本地伪造镜像来绕过。修复数字 UID 后，继续使用 GHCR 的真实拉取链路。
 
 ## 7. 失败与回退记录
 
 | 尝试 | 结果 | 处理方式 |
 | --- | --- | --- |
+| Pod 启动失败 | `CreateContainerConfigError` | 判定为镜像 USER 非数字，改为 `USER 10001:10001` 并设置 runAsUser |
 | 本地 SSH 直连 master | master 不信任本地公钥 | 改为通过跳板机转发 |
 | 使用 ProxyJump 直连 master | Permission denied | 改为跳板机内执行 SSH |
 | 华为云 SWR 公共镜像路径 | 401 Unauthorized | 放弃该路径，改用 GHCR |

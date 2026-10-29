@@ -42,7 +42,7 @@ Kubernetes 命名空间 sre-lab
 - node：172.31.12.103，工作节点，3.6 GiB / 50 GiB
 - Kubernetes：v1.34.1
 - 网络：Docker Hub 不可达，GHCR 可达
-- 当前没有业务工作负载、存储类和监控组件
+- 当前有 `demo-api` Deployment，但因 `runAsNonRoot` 与非数字用户配置处于 `CreateContainerConfigError`；没有存储类和监控组件
 
 ## 快速开始
 
@@ -115,6 +115,10 @@ kubectl -n sre-lab rollout undo deployment/demo-api
 ```
 
 记录：现象、Pod Events、假设、命令输出、修复动作和验证结果。
+
+### CreateContainerConfigError
+
+如果 Pod 事件出现 `container has runAsNonRoot and image has non-numeric user`，说明镜像的 `USER` 是用户名而不是数字 UID。修复方式是 Dockerfile 使用 `USER 10001:10001`，并在 Pod 的 `securityContext` 中设置 `runAsUser: 10001`、`runAsGroup: 10001`。
 
 ### 应用错误与慢请求
 
