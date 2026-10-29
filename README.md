@@ -42,7 +42,7 @@ Kubernetes 命名空间 sre-lab
 - node：172.31.12.103，工作节点，3.6 GiB / 50 GiB
 - Kubernetes：v1.34.1
 - 网络：Docker Hub 不可达，GHCR 可达
-- 当前有 `demo-api` Deployment，但因 `runAsNonRoot` 与非数字用户配置处于 `CreateContainerConfigError`；没有存储类和监控组件
+- 当前 `demo-api` Deployment 为 2/2 Running，镜像为 `ghcr.io/0tinna/sre-devops-lab:652760f...`；没有存储类和监控组件
 
 ## 快速开始
 

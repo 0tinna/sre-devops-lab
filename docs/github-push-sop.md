@@ -14,15 +14,16 @@ master 工作目录：`/opt/sre-devops-lab`
 | --- | --- | --- | --- |
 | 项目文件生成 | [x] | Codex | 已生成应用、Dockerfile、K8s 清单、CI、测试和文档 |
 | 项目传输到 master | [x] | Codex | 已解压到 `/opt/sre-devops-lab` |
-| Git 初始化与提交 | [x] | Codex | 当前 HEAD 为 `03bea91` |
+| Git 初始化与提交 | [x] | Codex | 当前 HEAD 为 `652760f` |
 | Git remote 配置 | [x] | Codex | 指向 `git@github.com:0tinna/sre-devops-lab.git` |
 | 部署密钥生成 | [x] | Codex | 私钥在 master，公钥在第 1 节 |
 | GitHub 添加部署密钥 | [x] | 用户 | 已完成，Allow write access 已勾选 |
 | 首次 push | [x] | 用户 | origin/main = `03bea91` |
 | GitHub Actions | [x] | GitHub | run 40799208887，结论 success |
 | GHCR 镜像 | [x] | GitHub Actions | 已生成并已被节点拉取 |
-| Kubernetes 部署 | [x] | 用户 | 资源已创建，但 Pod 处于 CreateContainerConfigError |
-| 镜像数字 UID 修复 | [ ] | Codex | 待提交新 Dockerfile 和 K8s 配置 |
+| Kubernetes 部署 | [x] | 用户 | Deployment 已创建 |
+| 镜像数字 UID 修复 | [x] | Codex | 提交 `652760f`，Actions 构建成功 |
+| 修复后验证 | [x] | Codex | 2/2 Running，healthz 和 readyz 返回 200 |
 | Prometheus / Grafana | [ ] | Codex | 后续阶段 |
 
 ## 1. 添加具有写权限的部署密钥

@@ -22,7 +22,8 @@
 - 在 GitHub 添加部署密钥，并完成首次 push。
 - GitHub Actions `ci` 由 push 自动触发，运行结果为 success。
 - GHCR 镜像已生成，并已被 node 节点拉取。
-- `sre-lab` 命名空间、Deployment 和 Service 已创建，但 Pod 启动失败。
+- `sre-lab` 命名空间、Deployment 和 Service 已创建。
+- 修复非数字 UID 后，Deployment 已滚动更新成功，Pod 为 2/2 Running，健康检查和指标端点返回 200。
 
 Codex 没有执行的操作：
 
@@ -108,8 +109,9 @@ Codex 没有执行的操作：
 | --- | --- | --- |
 | GitHub Actions 运行 | 已完成 | run 40799208887，结论 success |
 | GHCR 镜像 | 已生成 | `ghcr.io/0tinna/sre-devops-lab:03bea91...` 已被节点拉取 |
-| Kubernetes 业务部署 | 已创建但未就绪 | Pod 处于 `CreateContainerConfigError` |
-| 镜像数字 UID 修复 | 进行中 | Dockerfile 和 K8s securityContext 已改，待重新构建和发布 |
+| Kubernetes 业务部署 | 已就绪 | Deployment 2/2 Running |
+| 镜像数字 UID 修复 | 已完成 | 提交 `652760f`，GHCR 镜像已重新构建并部署 |
+| 修复后验证 | 已完成 | `/healthz` 和 `/readyz` 返回 200，`/metrics` 可访问 |
 | Prometheus / Grafana | 未安装 | 下一阶段 |
 | 告警规则 | 未配置 | 下一阶段 |
 | 故障演练 | 未执行 | 下一阶段 |
@@ -135,6 +137,24 @@ Dockerfile 中使用了 `USER app`，镜像配置里的 User 字段是字符串 
 - 需要重新提交、push、等待 GitHub Actions 构建新镜像，再滚动更新 Deployment。
 
 结论：这不是镜像拉取失败，也不需要本地伪造镜像来绕过。修复数字 UID 后，继续使用 GHCR 的真实拉取链路。
+
+## 6.2 2026-10-29 修复验证
+
+修复提交：`652760f82a18226b95eefa860b8d15fa8a12635d`
+
+GitHub Actions 结果：成功。
+
+Kubernetes 验证结果：
+
+- Deployment 为 `2/2`。
+- 两个 Pod 均为 `Running`。
+- 新镜像从 GHCR 成功拉取：`ghcr.io/0tinna/sre-devops-lab:652760f82a18226b95eefa860b8d15fa8a12635d`。
+- `/healthz` 返回 HTTP 200。
+- `/readyz` 返回 HTTP 200。
+- `/metrics` 返回 Prometheus 指标。
+- Gunicorn 启动日志正常。
+
+这次验证证明：镜像拉取链路正常，之前的故障是容器用户配置问题，不是网络或 GHCR 拉取失败。
 
 ## 7. 失败与回退记录
 
