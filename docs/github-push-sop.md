@@ -138,7 +138,7 @@ cd /opt/sre-devops-lab
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/app.yaml
 kubectl -n sre-lab set image deployment/demo-api \
-  demo-api=ghcr.io/0tinna/sre-devops-lab:03bea9199c5c9674684af0ee5cbb1f694ed2ece6
+  demo-api=ghcr.io/0tinna/sre-devops-lab:ec28bea7e44ddab7699311a0925890ad637181cd
 # rollout status deployment/demo-api 检查deployment这个有状态负载是否正常更新滚动
 kubectl -n sre-lab rollout status deployment/demo-api --timeout=120s
 kubectl -n sre-lab get pods -o wide
@@ -159,7 +159,7 @@ curl -s http://127.0.0.1:8080/metrics | head
 
 ```bash
 kubectl -n sre-lab get pods
-kubectl -n sre-lab describe pod <pod-name>
+kubectl -n sre-lab describe pod demo-api-b956dfb5-pk7tt
 kubectl -n sre-lab get events --sort-by=.lastTimestamp
 ```
 

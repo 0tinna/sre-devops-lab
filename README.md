@@ -18,6 +18,7 @@
 - `scripts/opsctl.py`：集群盘点、健康检查、日志收集、发布和回滚
 - `docs/cluster-inventory.md`：真实集群盘点记录
 - `docs/github-push-sop.md`：GitHub 部署密钥与推送 SOP
+- `docs/manual-from-zero-to-one.md`：完全由个人操作的从 0 到 1 实践手册
 
 ## 架构
 
