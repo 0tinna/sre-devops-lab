@@ -1,4 +1,4 @@
-﻿# 操作审计记录
+# 操作审计记录
 
 记录日期：2026-10-29
 
@@ -303,3 +303,66 @@ kubectl get namespace sre-lab
 
 文档同时给出通用排查模型（分层 → 权威证据 → 可证伪测量 → 最小改动 → 同组测量验证 → 记录）、
 诊断命令速查表和复盘方法论。
+
+## 13. 2026-11-05 项目整理与发布验证
+
+### 13.1 文档重构（SOP 改为学习路径版）
+
+`docs/troubleshooting-sop.md` 从「按问题编号」改组为「按学习顺序」的 9 节课：
+
+```text
+1 打通作业通道        6 指标正确性
+2 镜像供应链          7 告警表达式设计
+3 容器启动与安全上下文  8 告警生命周期
+4 调度与容量规划       9 变更校验流程
+5 探针与就绪语义
+```
+
+每课统一为：学习目标 → 前置 → 核心概念 → 现象 → 诊断 → 根因 → 处置 → 验证 → **自检（含折叠答案）**。
+
+新增 `docs/README.md` 作为文档导航，含按角色（面试 / 接手 / 排障 / 开发）的入口。
+
+### 13.2 四个提交
+
+| 提交 | 内容 |
+| --- | --- |
+| `2d606b0` | feat(app)：受控内存端点 + 多 worker 指标修复 + `.dockerignore` |
+| `84a0d4f` | feat(monitoring)：监控栈 6 个清单文件 |
+| `7ae0f27` | feat(cli)：`opsctl monitoring` 子命令 |
+| `cce5412` | docs：9 课 SOP、导航、runbook、计划、交接、审计 |
+
+推送：`4bc3dcf..cce5412  main -> main`，CI 触发后 60 秒产出镜像
+`ghcr.io/0tinna/sre-devops-lab:cce5412d...`。
+
+### 13.3 发布过程再次踩坑（已补进 SOP 第 9 课）
+
+**问题：`opsctl deploy` 用 `set image` 发布，env 和 volume 没生效。**
+
+- 现象：Pod Running、镜像 SHA 正确，但 `kubectl get deploy -o jsonpath env` 只显示 `PORT`，
+  新增的 `ENABLE_FAULT_ENDPOINTS`、`PROMETHEUS_MULTIPROC_DIR` 全部缺失。
+- 根因：`set image` 只改 `.spec.template.spec.containers[0].image` 一个字段。
+- 修复：渲染带 SHA 的清单后 `kubectl apply`，确认 5 个 env 全部就位：
+  `PORT ENABLE_FAULT_ENDPOINTS PROMETHEUS_MULTIPROC_DIR GUNICORN_WORKERS GUNICORN_THREADS`。
+- 另一发现：`opsctl deploy` 默认 `--timeout 120s`，新镜像冷启动拉取（约 80 秒）
+  会触发超时并返回非零——脚本判定行为正确，但默认值对冷缓存偏紧。
+
+### 13.4 multiprocess 修复的验证结果
+
+| 项目 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 容器内计数器 | `53536 → 66702 → 53542 → 66708` | `3 → 6 → 9 → 12 → 15 → 18 → 21 → 24` |
+| `query_range` drops | 3 / 12 | **0 / 7** |
+| `rate(/readyz[2m])` | 1366/s（误报） | **0.400/s** |
+| 与真实值比对 | 差 3400 倍 | 探针 5s × 2 Pod = 0.4/s，**完全吻合** |
+| `DemoApiHighErrorRate` | 注入 720 次 500 仍不触发 | **pending → firing** |
+| Alertmanager | 收不到 | 收到 `active`，停止注入后自动 resolved |
+
+验证方式：容器内无 curl/wget，改用 `python3 -c "urllib.request..."`。
+
+### 13.5 当前集群状态
+
+```text
+demo-api   2/2 Running   镜像 cce5412d...   3 个故障端点可用
+monitoring 6/6 Ready     7/7 target up      10 条规则 health=ok
+告警       0 条          全部已消解
+```

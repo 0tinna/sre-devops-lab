@@ -6,6 +6,10 @@
 
 ## 0. 本轮实测的现状
 
+> **更新（2026-11-05 14:20）**：本文档写作时监控栈尚未部署、应用镜像仍是 `652760f`。
+> 现在 **P1 已全部完成**，监控栈上线、新镜像 `cce5412d` 已发布、multiprocess 修复验证通过。
+> 完成情况见 §7。
+
 | 项目 | 实测结果 | 结论 |
 | --- | --- | --- |
 | 节点 | master / node 均 Ready，v1.34.1，已运行 7d | 环境仍在，可直接继续 |
@@ -106,3 +110,47 @@ P2-5 需要给 `app/app.py` 加一个受控内存分配端点（默认关闭，�
 - node-exporter 用 `hostNetwork` + `hostPort 9100`：仅占用一个端口，删除 DaemonSet 后释放。
 - 镜像代理是外部依赖，若 daocloud 失效，备用 `registry.cn-hangzhou.aliyuncs.com` 与 `quay.io`（需容忍超时重试）。
 - 压测与故障注入只在 `sre-lab` 命名空间内进行，禁止动 `kube-system`。
+
+## 7. 完成情况（2026-11-05 14:20 更新）
+
+### P1 监控闭环 —— 已完成
+
+| # | 动作 | 状态 | 证据 |
+| --- | --- | --- | --- |
+| P1-1 | 清单推送 main | ✅ | 提交 `84a0d4f`，push 到 `cce5412` |
+| P1-2 | `kubectl apply` 监控栈 | ✅ | monitoring 命名空间 6/6 Pod Ready |
+| P1-3 | 抓取检查 | ✅ | 7/7 target `up`，10 条规则 `health=ok` |
+| P1-4 | Grafana 看板 | ✅ | 数据源 + 13 面板均由 ConfigMap provisioning，无需手工导入 |
+| P1-5 | 告警注入 | ✅ | `DemoApiHighErrorRate` pending → firing，Alertmanager 收到 active |
+| P1-6 | 告警恢复 | ✅ | 停止注入后自动 resolved，alerts 归零 |
+
+额外完成：`TargetDown`、`PodRestartTooOften` 在 CrashLoop 演练中真实触发并自动消解。
+
+### P2 故障演练 —— 部分完成
+
+| # | 故障 | 状态 | 说明 |
+| --- | --- | --- | --- |
+| P2-1 | 自愈 | 未单独执行 | 发布滚动中已间接验证 |
+| P2-2 | ImagePullBackOff | 待执行 | 需占位 tag |
+| P2-3 | CrashLoopBackOff | ✅ 已执行 | `command: /bin/false` → 4 次重启 → 双告警 firing → `rollout undo` 恢复 |
+| P2-4 | Pending | 待执行 | |
+| P2-5 | OOMKilled | **可执行** | `/simulate/memory` 已随新镜像上线，验证返回 200 |
+| P2-6 | 慢请求 P95 | 待执行 | |
+| P2-7 | 回滚演练 | ✅ 部分 | `rollout undo` 已验证，`opsctl rollback` 待补 |
+
+### 新增发现（原计划的盲区）
+
+| 发现 | 影响 | 已处理 |
+| --- | --- | --- |
+| kube-state-metrics 探针端点写错 | Pod 永远 NotReady | 改为 `telemetry/readyz` + `http-metrics/livez` |
+| gunicorn 多 worker 计数器抖动 | 5xx 告警永不触发 | multiprocess 模式，实测 `drops` 从 3/12 → 0/7 |
+| 5xx 比例被探针稀释 | 阈值永远达不到 | 分母排除 `/healthz\|/readyz\|/metrics` |
+| `set image` 不应用 env/volume | 新配置静默丢失 | 改用 `apply` + 抽查关键字段 |
+| `opsctl deploy` 超时 120s 偏紧 | 冷启动拉取会误报失败 | 演练时显式传 `--timeout 300s` |
+| registry.k8s.io 重定向域名解析失败 | kube-state-metrics 拉不下来 | 改用 `k8s.m.daocloud.io` |
+
+### P3 交付与自动化 —— 未开始
+
+- self-hosted runner：未开始。
+- `opsctl monitoring`：**已完成**（超出原计划，提前交付）。
+- `scripts/teardown.sh`：未开始。

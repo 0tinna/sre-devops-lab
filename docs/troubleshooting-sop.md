@@ -22,7 +22,7 @@
 | [6](#第-6-课--指标正确性) | 指标正确性 | 多 worker 计数器抖动，告警永不触发 |
 | [7](#第-7-课--告警表达式设计) | 告警表达式设计 | 错误率被探针稀释 |
 | [8](#第-8-课--告警生命周期) | 告警生命周期 | 告警长时间不消解 |
-| [9](#第-9-课--变更校验流程) | 变更校验流程 | dry-run 级别选错 |
+| [9](#第-9-课--变更校验流程) | 变更校验流程 | `set image` 丢配置、dry-run 级别 |
 
 ---
 
@@ -797,7 +797,33 @@ kubectl -n sre-lab exec $POD -- wget -qO- http://127.0.0.1:8080/metrics | grep d
 
 两次值必须**单调递增且连续**。再查 `query_range`，`drops` 必须是 `0`。
 
-### 6.7 预防
+> **注意**：如果镜像基于 `python:*-slim`，里面**没有 `curl` 也没有 `wget`**，
+> `kubectl exec -- wget` 会静默返回空。用 python 代替：
+
+```bash
+kubectl -n sre-lab exec $POD -- python3 -c "
+import urllib.request
+d = urllib.request.urlopen('http://127.0.0.1:8080/metrics').read().decode()
+for line in d.splitlines():
+    if line.startswith('demo_http_requests_total') and 'path=\"/readyz\"' in line:
+        print(line.split()[-1]); break
+"
+```
+
+### 6.7 修复前后对照（本项目实测）
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 容器内计数器采样 | `53536 → 66702 → 53542 → 66708`（来回跳） | `3 → 6 → 9 → 12 → 15 → 18 → 21 → 24`（单调递增） |
+| `query_range` 的 drops | 3 / 12 | **0 / 7** |
+| `rate(/readyz[2m])` | **1366/s**（误报） | **0.400/s** |
+| 真实值校验 | 探针 5s 一次 × 2 Pod = 0.4/s | ✅ 完全吻合 |
+| 5xx 告警 | 注入 720 次 500 仍不触发 | 注入后 **pending → firing** |
+| Alertmanager | 收不到 | 收到 `DemoApiHighErrorRate` active，停止注入后自动 resolved |
+
+**误差 3400 倍**：`1366 / 0.4 = 3415`。这就是"指标看着有、数字全错"的危害量级。
+
+### 6.8 预防
 
 - 任何**多进程/多 worker** 的 Python 服务（gunicorn、uWSGI、celery）接入 Prometheus 前，
   先确认是否需要 multiprocess 模式。
@@ -999,7 +1025,52 @@ T+15min PodRestartTooOften resolved（窗口 15m，等样本滑出）
 | `--dry-run=client` | 语法、字段类型、基本结构 | ❌ 不需要 |
 | `--dry-run=server` | 准入控制、默认值填充、引用存在性 | ✅ 需要 |
 
-### 9.2 现象
+### 9.2 一个真实的坑：`set image` 不会应用 env 和 volume
+
+**本项目实际踩到**：用 `opsctl deploy` / `kubectl set image` 发布新镜像，
+Pod 成功 Running、镜像也对，但新加的 `PROMETHEUS_MULTIPROC_DIR` 环境变量
+和 `emptyDir` 挂载**根本没有生效**：
+
+```bash
+kubectl -n sre-lab get deploy demo-api -o jsonpath='{.spec.template.spec.containers[0].env[*].name}'
+# 输出：PORT                                    ← 只有旧的，新增的全丢了
+```
+
+**原因**：`set image` 只修改 `.spec.template.spec.containers[0].image` 这一个字段，
+清单里其他改动不会同步。用 `set image` 部署"代码没问题"，但"配置没更新"。
+
+**正确流程**：
+
+```bash
+# ① 渲染出带具体 SHA 的清单（把模板里的 latest 换成真实版本）
+SHA=<commit-sha>
+sed "s|image: ghcr.io/0tinna/sre-devops-lab:latest|image: ghcr.io/0tinna/sre-devops-lab:$SHA|" \
+  k8s/app.yaml > /tmp/app-render.yaml
+
+# ② 先校验
+kubectl apply --dry-run=client -f /tmp/app-render.yaml
+
+# ③ 再 apply（env / volume / probe / 资源全部同步）
+kubectl apply -f /tmp/app-render.yaml
+kubectl -n sre-lab rollout status deploy/demo-api --timeout=300s
+
+# ④ 确认关键字段真的进去了
+kubectl -n sre-lab get deploy demo-api -o jsonpath='{.spec.template.spec.containers[0].env[*].name}{"\n"}'
+```
+
+**判断规则**：
+
+| 改动范围 | 用哪个 |
+| --- | --- |
+| 只换镜像版本（热修） | `set image` 可以 |
+| 改了 env / volume / probe / resources / 安全上下文 | **必须 `apply`** |
+| 不确定 | 永远用 `apply` |
+
+**教训**：`rollout status` 成功不代表"想要的配置生效了"。
+它只保证"Pod 起来了"，不保证"Pod 用的是你以为的那份配置"。
+**每次发布后都要抽查关键字段**，这是第 9 课的核心习惯。
+
+### 9.3 现象：dry-run 报 namespace 不存在
 
 校验多文档清单时大量报错：
 
@@ -1008,12 +1079,12 @@ Error from server (NotFound): error when creating "00-namespace-rbac.yaml":
 namespaces "monitoring" not found
 ```
 
-### 9.3 根因
+### 9.4 根因
 
 `--dry-run=server` 会真的走到 API server 做校验，但**不会真的创建 namespace**，
 所以后续对象引用的 namespace 不存在。**这是预期行为，不是清单写错。**
 
-### 9.4 处置：固定三步流程
+### 9.5 处置：固定三步流程
 
 ```bash
 # ① 静态校验：不需要依赖对象存在
@@ -1029,7 +1100,7 @@ kubectl -n monitoring get pods -w
 **本项目实际做法**：先用 client 校验全部 21 个对象通过，再真正 apply。
 server dry-run 只在 namespace 已存在时才有意义。
 
-### 9.5 验证清单
+### 9.6 验证清单
 
 发布前必查：
 
@@ -1039,15 +1110,33 @@ python -m unittest discover -s tests         # 单元测试
 kubectl apply --dry-run=client -f <dir>      # 清单结构
 ```
 
-发布后必查：
+发布后必查（**不只是看 Pod 起来没有**）：
 
 ```bash
-kubectl -n <ns> rollout status deploy/<name> --timeout=120s
+kubectl -n <ns> rollout status deploy/<name> --timeout=300s
 kubectl -n <ns> get pods
 kubectl -n <ns> get events --sort-by=.lastTimestamp | tail
+
+# 关键：抽查"我这次改的字段"是否真的生效
+kubectl -n <ns> get deploy <name> -o jsonpath='{.spec.template.spec.containers[0].env[*].name}{"\n"}'
+kubectl -n <ns> get deploy <name> -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
-### 9.6 预防
+**用 python 验证应用行为**（slim 镜像里没有 curl/wget）：
+
+```bash
+kubectl -n <ns> exec <pod> -- python3 -c "
+import urllib.request, urllib.error
+for p in ['/healthz','/readyz','/simulate/error']:
+    try:
+        r = urllib.request.urlopen('http://127.0.0.1:8080'+p)
+        print(p, r.status, r.read()[:60])
+    except urllib.error.HTTPError as e:
+        print(p, e.code, e.read()[:60])
+"
+```
+
+### 9.7 预防
 
 把校验写进 CI，而不是靠人记得。本项目 `ci.yml` 已经包含
 compile check + unit test，`--dry-run` 因为需要集群凭证所以留给本地/部署机执行。
@@ -1056,16 +1145,18 @@ compile check + unit test，`--dry-run` 因为需要集群凭证所以留给本�
 
 1. 只跑 `--dry-run=server` 校验新命名空间的清单，会得到什么结果？
 2. 为什么 CI 里不做 `--dry-run=server`？
-3. 发布后只看 `rollout status` 够不够？
-4. 校验清单时 client 和 server 应该都跑吗？
+3. 发布后 `rollout status` 成功，能说明配置生效了吗？
+4. 用 `set image` 发布一个"同时改了 env"的版本，会发生什么？
+5. 校验清单时 client 和 server 应该都跑吗？
 
 <details>
 <summary>参考答案</summary>
 
 1. 大量 `namespaces "xxx" not found`，因为 server dry-run 不创建 namespace，后续对象引用不到。
 2. 因为 server dry-run 需要连接真实集群和凭证。公网 CI runner 不应该持有集群 kubeconfig（本项目明确不采用这个方案）。
-3. 不够。`rollout status` 只保证副本就绪，不保证应用行为正确，还要看 Events、日志和健康端点。
-4. 建议都跑：client 快速抓语法错误，server 在依赖存在时做语义校验。顺序是先 client 后 server。
+3. 不能。`rollout status` 只保证"Pod 起来且就绪"，不保证"Pod 用的是你以为的那份配置"。本项目实际踩过：镜像更新成功，但新增的 env 和 emptyDir 全部没生效，Pod 照样 Running。
+4. 只有镜像字段被更新，env / volume / probe 等改动全部丢失，且不会有任何报错。表现为"新代码在跑，但新配置没生效"，极难排查。
+5. 建议都跑：client 快速抓语法错误，server 在依赖存在时做语义校验。顺序是先 client 后 server。
 
 </details>
 
@@ -1118,7 +1209,8 @@ kubectl -n <ns> rollout history deploy/<name>
 | 6 | 告警永不触发、`rate()` 离谱 | 多 worker 计数器互相覆盖 |
 | 7 | 错误率偏低、阈值达不到 | 探针高频 200 稀释分母 |
 | 8 | 告警长时间不消解 | 长窗口样本未滑出，正常 |
-| 9 | dry-run 报 namespace 不存在 | server dry-run 不创建依赖对象 |
+| 9a | 改了 env/volume 但没生效、`set image` 后行为异常 | `set image` 只改镜像字段 |
+| 9b | dry-run 报 namespace 不存在 | server dry-run 不创建依赖对象 |
 
 ## 附录 C · 复盘方法论
 
