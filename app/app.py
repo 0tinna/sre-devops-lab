@@ -3,10 +3,33 @@ import random
 import time
 
 from flask import Flask, Response, g, jsonify, request
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+    CollectorRegistry,
+    Counter,
+    Histogram,
+    generate_latest,
+    multiprocess,
+)
 
 
 app = Flask(__name__)
+
+# multiprocess 模式：gunicorn 多 worker 时必须启用，否则各 worker 的计数器互相覆盖。
+# 由 Deployment 提供 PROMETHEUS_MULTIPROC_DIR 与一个可写的 emptyDir。
+_MULTIPROC_DIR = os.getenv('PROMETHEUS_MULTIPROC_DIR')
+
+
+def _metrics_registry():
+    if not _MULTIPROC_DIR:
+        return REGISTRY
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    return registry
+
+
+METRICS_REGISTRY = _metrics_registry()
 
 REQUEST_COUNT = Counter(
     'demo_http_requests_total',
@@ -54,20 +77,48 @@ def create_order():
     return jsonify(order_id=random.randint(1000, 9999), status='created')
 
 
+FAULT_ENDPOINTS_ENABLED = os.getenv('ENABLE_FAULT_ENDPOINTS', '0') == '1'
+
+
+def _fault_disabled():
+    return jsonify(error='fault endpoints disabled', hint='set ENABLE_FAULT_ENDPOINTS=1'), 404
+
+
 @app.get('/simulate/error')
 def simulate_error():
+    if not FAULT_ENDPOINTS_ENABLED:
+        return _fault_disabled()
     return jsonify(error='simulated failure'), 500
 
 
 @app.get('/simulate/slow')
 def simulate_slow():
+    if not FAULT_ENDPOINTS_ENABLED:
+        return _fault_disabled()
     time.sleep(2)
     return jsonify(status='slow response')
 
 
+@app.get('/simulate/memory')
+def simulate_memory():
+    """受控内存分配，用于演练 OOMKilled 与 container_memory 告警。
+
+    默认关闭：只有显式设置 ENABLE_FAULT_ENDPOINTS=1 才可用，避免误触发生产式故障。
+    参数：mib=每次分配总量，hold=保持秒数。
+    """
+    if not FAULT_ENDPOINTS_ENABLED:
+        return _fault_disabled()
+    mib = int(request.args.get('mib', '64'))
+    hold = int(request.args.get('hold', '30'))
+    block = b'x' * (1024 * 1024)
+    chunks = [block for _ in range(max(mib, 0))]
+    time.sleep(max(hold, 0))
+    return jsonify(allocated_mib=len(chunks), held_seconds=max(hold, 0))
+
+
 @app.get('/metrics')
 def metrics():
-    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+    return Response(generate_latest(METRICS_REGISTRY), mimetype=CONTENT_TYPE_LATEST)
 
 
 if __name__ == '__main__':

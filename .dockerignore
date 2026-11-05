@@ -1,0 +1,12 @@
+# 多阶段构建只用到 app/ 目录，其余不进构建上下文，减小传输体积
+.git
+.github
+.gitignore
+.dockerignore
+docs
+tests
+k8s
+scripts
+**/__pycache__
+**/*.pyc
+*.md
