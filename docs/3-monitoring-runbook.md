@@ -130,7 +130,7 @@ kubectl -n sre-lab rollout undo deploy/demo-api
 需要新镜像（`/simulate/memory` 端点是本次新增的）。先把应用重新发布一次：
 
 ```bash
-# 1. 发布带 /simulate/memory 的新镜像（见 docs/next-phase-plan.md P1 流程）
+# 1. 发布带 /simulate/memory 的新镜像（见 docs/4-next-phase-plan.md P1 流程）
 # 2. 临时压低内存 limit
 kubectl -n sre-lab set resources deploy/demo-api --limits=memory=64Mi --requests=memory=64Mi
 # 3. 触发分配

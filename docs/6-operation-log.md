@@ -282,7 +282,7 @@ kubectl get namespace sre-lab
 
 ## 12. 2026-11-05 排查 SOP 归档
 
-本轮所有真实问题已整理成 `docs/troubleshooting-sop.md`，共 14 条（TS-01 下含 3 个子类）：
+本轮所有真实问题已整理成 `docs/2-troubleshooting-sop.md`，共 14 条（TS-01 下含 3 个子类）：
 
 | 编号 | 问题 | 归档内容 |
 | --- | --- | --- |
@@ -308,7 +308,7 @@ kubectl get namespace sre-lab
 
 ### 13.1 文档重构（SOP 改为学习路径版）
 
-`docs/troubleshooting-sop.md` 从「按问题编号」改组为「按学习顺序」的 9 节课：
+`docs/2-troubleshooting-sop.md` 从「按问题编号」改组为「按学习顺序」的 9 节课：
 
 ```text
 1 打通作业通道        6 指标正确性

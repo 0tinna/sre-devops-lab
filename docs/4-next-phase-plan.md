@@ -64,7 +64,7 @@ NodeMemoryPressure / NodeDiskPressure / NodeHighCPU   容量类
 | P1-3 | 检查抓取：`kubectl -n monitoring port-forward svc/prometheus 9090` → `/targets` | 4 个 job 全部 `UP`，rule 文件 10 条规则 Loaded |
 | P1-4 | Grafana 建 3 个面板：服务 RED（rate/错误率/P95）、Pod 资源（CPU/内存 vs request）、节点容量（内存/磁盘） | 面板能出图，数据源 `Prometheus` 默认可用 |
 | P1-5 | **告警注入**：`for i in $(seq 1 40); do curl -s .../simulate/error; done` | Prometheus 里 `DemoApiHighErrorRate` 依次 Pending → Firing；Alertmanager UI 出现该告警 |
-| P1-6 | 告警恢复：停止注入 2 分钟后观察 | 告警变为 Resolved，`docs/operation-log.md` 记录起止时间与截图路径 |
+| P1-6 | 告警恢复：停止注入 2 分钟后观察 | 告警变为 Resolved，`docs/6-operation-log.md` 记录起止时间与截图路径 |
 
 演示前必须把 Grafana 默认口令改掉（清单里已写覆盖命令）。
 

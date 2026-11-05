@@ -21,21 +21,21 @@
 
 ## 文档
 
-完整索引见 [`docs/README.md`](docs/README.md)。推荐阅读顺序：
+**文件名前面的数字就是学习顺序**，按 1 → 9 读即可。完整索引见 [`docs/README.md`](docs/README.md)。
 
-| 顺序 | 文档 | 内容 |
+| 编号 | 文档 | 内容 |
 | --- | --- | --- |
-| 1 | [`docs/manual-from-zero-to-one.md`](docs/manual-from-zero-to-one.md) | 从 0 到 1 实践手册：这个项目怎么搭起来的 |
-| 2 | [`docs/troubleshooting-sop.md`](docs/troubleshooting-sop.md) | **9 节课的故障排查 SOP**，真实问题提炼 |
-| 3 | [`docs/monitoring-runbook.md`](docs/monitoring-runbook.md) | 监控访问、10 条告警清单、D1–D8 演练步骤 |
-| 4 | [`docs/next-phase-plan.md`](docs/next-phase-plan.md) | 下一阶段计划与实测证据 |
-| 5 | [`docs/cluster-inventory.md`](docs/cluster-inventory.md) | 硬件、网络、已装组件的事实基线 |
-| 6 | [`docs/operation-log.md`](docs/operation-log.md) | 每个动作的时间线与执行者 |
+| 1 | [`1-manual-from-zero-to-one.md`](docs/1-manual-from-zero-to-one.md) | 从 0 到 1 实践手册：这个项目怎么搭起来的 |
+| 2 | [`2-troubleshooting-sop.md`](docs/2-troubleshooting-sop.md) | **9 节课的故障排查 SOP**，真实问题提炼，每课含自检题 |
+| 3 | [`3-monitoring-runbook.md`](docs/3-monitoring-runbook.md) | 监控访问、10 条告警清单、D1–D8 演练步骤 |
+| 4 | [`4-next-phase-plan.md`](docs/4-next-phase-plan.md) | 下一阶段计划、实测证据与完成情况 |
+| 5 | [`5-cluster-inventory.md`](docs/5-cluster-inventory.md) | 硬件、网络、已装组件的事实基线 |
+| 6 | [`6-operation-log.md`](docs/6-operation-log.md) | 每个动作的时间线与执行者 |
+| 7 | [`7-github-push-sop.md`](docs/7-github-push-sop.md) | GitHub 部署密钥与推送 SOP |
+| 8 | [`8-handoff-2026-11-05.md`](docs/8-handoff-2026-11-05.md) | 项目交接摘要：当前状态与待办 |
+| 9 | [`9-interview-pitch.md`](docs/9-interview-pitch.md) | 面试表述与追问应对：30 秒版、可深讲的故事 |
 
-辅助文档：
-
-- [`docs/github-push-sop.md`](docs/github-push-sop.md)：GitHub 部署密钥与推送 SOP
-- [`docs/handoff-2026-11-05.md`](docs/handoff-2026-11-05.md)：项目交接摘要（含面试表述）
+只想知道"现在什么状态"，读 8；想学排查方法，读 2；想准备面试，读 9。
 
 ## 架构
 
@@ -167,7 +167,7 @@ kubectl -n sre-lab get pods -w
 
 ## 下一阶段
 
-详细拆分、验收标准与实测证据见 `docs/next-phase-plan.md`。
+详细拆分、验收标准与实测证据见 `docs/4-next-phase-plan.md`。
 
 监控清单已落在 `k8s/monitoring/`（未 apply），包含 Prometheus、Alertmanager、node-exporter、kube-state-metrics、Grafana，以及 10 条告警规则：
 
@@ -208,7 +208,7 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000       # 默认 admin / 
 
 ## 操作透明度
 
-本项目把自动执行和人工操作分开记录。详细时间线见 `docs/operation-log.md`。
+本项目把自动执行和人工操作分开记录。详细时间线见 `docs/6-operation-log.md`。
 
 - `[x]` 表示已经由 Codex 执行。
 - `[ ]` 表示等待用户或后续阶段执行。
