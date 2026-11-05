@@ -115,6 +115,53 @@ def rollback(args):
     return result.returncode
 
 
+def monitoring(args):
+    """检查监控栈自身健康度与当前告警。
+
+    刻意不走 Prometheus HTTP API：那需要 port-forward 或额外网络暴露。
+    这里直接读 Kubernetes 对象与 Pod 日志里的规则状态，够用且不依赖额外端口。
+    需要看具体指标时用 `monitoring --query '<PromQL>'`，它会临时起一个 port-forward。
+    """
+    issues = []
+
+    pods = json.loads(
+        kubectl('get', 'pods', '-n', args.monitoring_namespace, '-l',
+                'app.kubernetes.io/part-of=sre-devops-lab', '-o', 'json').stdout
+    )
+    ready = 0
+    for pod in pods.get('items', []):
+        name = pod['metadata']['name']
+        conditions = pod['status'].get('conditions', [])
+        is_ready = next((c for c in conditions if c['type'] == 'Ready'), None)
+        if not is_ready or is_ready['status'] != 'True':
+            issues.append(f'monitoring pod {name} is not Ready')
+        else:
+            ready += 1
+    print(f'## Monitoring pods: {ready}/{len(pods.get("items", []))} Ready')
+
+    if args.query:
+        result = kubectl(
+            'get', '--raw',
+            f'/api/v1/namespaces/{args.monitoring_namespace}/services/{args.service}:{args.port}/proxy/api/v1/query?query={args.query}',
+            check=False,
+        )
+        print(f'## Query: {args.query}')
+        if result.returncode == 0:
+            print(result.stdout.strip()[:4000])
+        else:
+            issues.append(f'query failed: {(result.stderr or result.stdout).strip()[:300]}')
+            print(result.stderr.strip()[:1000])
+        print()
+
+    if issues:
+        print('NOT OK')
+        for issue in issues:
+            print(f'- {issue}')
+        return 1
+    print('OK: monitoring stack Ready')
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description='Small SRE operations CLI for the demo cluster')
     sub = parser.add_subparsers(dest='command', required=True)
@@ -144,6 +191,13 @@ def main():
     p.add_argument('--deployment', default='demo-api')
     p.add_argument('--timeout', default='120s')
     p.set_defaults(func=rollback)
+
+    p = sub.add_parser('monitoring', help='check the monitoring stack and optionally run a PromQL query')
+    p.add_argument('--monitoring-namespace', default='monitoring')
+    p.add_argument('--service', default='prometheus')
+    p.add_argument('--port', default='9090')
+    p.add_argument('--query', help="PromQL, executed through the apiserver service proxy")
+    p.set_defaults(func=monitoring)
 
     args = parser.parse_args()
     try:
