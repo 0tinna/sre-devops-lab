@@ -445,6 +445,204 @@ SOP 第 5 课「探针与就绪语义」中的因果链部分。
 
 ---
 
+## S9 · 日志有 ERROR，但指标全绿
+
+### 根因
+
+`/simulate/degraded` 模拟下游依赖超时：异常被 `try/except` 捕获，
+应用降级返回缓存数据，**HTTP 状态码 200**，但日志里记 `ERROR`。
+
+这是"静默降级"——用户拿到的是过期数据，但所有技术指标都显示正常。
+
+### 判据链
+
+```text
+① summary.txt / describe.txt → Pod 全 1/1 Running，无重启，无 Events 异常
+   → 排除调度、启动、探针问题
+
+② metrics.txt →
+   ALERTS{alertstate="firing"} = (无数据)      ← 没有任何告警
+   sum by (pod) (rate(demo_http_requests_total[5m])) → 只有 200，没有 5xx
+   histogram_quantile(0.95, ...) = 0.00475      ← P95 只有 4.7ms，极快
+   → 从指标看，一切完美
+
+③ logs-loki.txt 是关键转折点 →
+   各 Pod 的 ERROR 行数: demo-api-xxx = 21, demo-api-yyy = 19
+   ERROR 样本: "downstream call failed, serving stale cache:
+                inventory-service did not respond within 2.4s"
+   → 日志里明确写了"降级返回"
+
+④ 对照最近日志：
+   "GET /simulate/degraded HTTP/1.1" 200 144
+   紧邻的上一行是 ERROR
+   → 每个 200 响应的背后都有一次失败的下游调用
+```
+
+### 为什么指标完全看不出来
+
+| 维度 | 该场景下的表现 | 原因 |
+| --- | --- | --- |
+| HTTP 状态码 | 200 | 应用决定降级而不报错 |
+| 5xx 比例 | 0 | 没有 5xx |
+| P95 延迟 | 4.7ms（更快了） | 走缓存，比正常查库还快 |
+| 请求速率 | 正常 | 流量没有变化 |
+| Pod 重启 | 0 | 容器健康 |
+
+**这是最危险的故障类型**：所有 SLO 指标都好看，但业务已经错了。
+
+### 常见误判
+
+| 误判 | 为什么错 |
+| --- | --- |
+| "指标全绿说明没问题" | 指标只反映"请求有没有成功返回"，不反映"返回的内容对不对" |
+| "延迟还降低了，是不是优化了" | 降级走缓存，当然更快——**变快可能是变坏的信号** |
+| "没告警就不用管" | 告警是基于指标的，指标没覆盖到的故障自然不告警 |
+| 只看 `kubectl get pods` | 状态正常不代表业务正常 |
+
+### 修复与预防
+
+**这类问题不可能靠"修复"解决，只能靠"发现"**：
+
+1. **日志告警**：基于 Loki 的 `count_over_time({...} |~ "ERROR" [5m])` 建告警
+2. **业务指标**：加一个 `demo_degraded_responses_total` 计数器，让降级行为可被度量
+3. **契约测试**：响应里带 `source=stale-cache` 时，上游应该能识别
+4. **SLO 定义**：把"返回新鲜数据"纳入 SLI，而不只是"返回 200"
+
+本项目的改进方向（可作为后续任务）：
+
+```python
+# 在 /simulate/degraded 里加计数器
+DEGRADED_COUNT = Counter('demo_degraded_responses_total', 'Responses served from stale cache')
+DEGRADED_COUNT.inc()
+# 然后加告警：rate(demo_degraded_responses_total[5m]) > 0
+```
+
+### 对应课
+
+SOP 第 7 课「告警表达式设计」+ 附录 D。
+
+**核心教训**：**指标的覆盖面决定了监控的天花板**。
+没有对应的指标，再多的告警规则也看不见这类故障。
+
+---
+
+## S10 · 日志采集静默中断
+
+### 根因
+
+给 Fluent Bit 的 DaemonSet 加了不匹配的 `nodeSelector`（`drill-disabled: "true"`），
+两个节点上的采集器 Pod 都被驱逐。**日志不再上报到 Loki，但服务完全不受影响。**
+
+### 判据链
+
+```text
+① summary.txt → 集群、服务、Pod 全部正常
+   demo-api 2/2 Running，无重启，无 Events 异常
+
+② metrics.txt →
+   sum(up) = 7          ← Prometheus 抓取正常
+   ALERTS = (无数据)     ← 没有告警
+   → 指标维度完全健康
+
+③ logs-loki.txt 的对比是关键 →
+   采集时间:     2026-11-05 17:04:23
+   最新日志时间: 2026-11-05T17:00:17
+   → 差了 4 分钟。正常情况下应该是几秒到十几秒
+
+④ 继续看 logs-loki.txt →
+   各命名空间日志量: monitoring = 87, sre-lab = 633
+   这些是"存量"，不是新增
+   → 日志管道已经断了
+
+⑤ 去查采集器本身 →
+   kubectl -n monitoring get pods -l app.kubernetes.io/name=fluent-bit
+   → No resources found
+   kubectl -n monitoring get ds fluent-bit -o jsonpath='{.spec.template.spec.nodeSelector}'
+   → {"drill-disabled":"true"}   ← 找到了
+```
+
+### 关键判据：时间差
+
+**这是排查"日志断了"唯一可靠的量化判据**：
+
+```text
+采集时间 - 最新日志时间戳 = ?
+  几秒 ~ 几十秒  → 正常
+  几分钟以上     → 管道断了（或应用真的不打日志了）
+```
+
+只看"日志量 633 行"会以为没问题，但那可能是几十分钟前积累的存量。
+
+### 三种"查不到日志"的区分
+
+| 情况 | Pod 状态 | Loki 有历史 | 时间差 | 结论 |
+| --- | --- | --- | --- | --- |
+| 应用没打日志 | 正常 | 有 | 大 | 应用问题，看代码 |
+| 采集器挂了 | 正常 | 有 | 大 | **本场景** |
+| Loki 挂了 | 正常 | 无/查询失败 | — | 存储问题 |
+
+**区分方法**：看采集器 Pod 是否存在，再看 Loki 自身 `/ready`。
+
+### 常见误判
+
+| 误判 | 为什么错 |
+| --- | --- |
+| "日志量还有 633 行，说明正常" | 那是存量。要看**最新一条的时间** |
+| "服务正常，日志不重要" | 出故障时你就是瞎的——这次能查，下次真出事查不了 |
+| "查不到日志就是应用没打" | 先确认采集链路活着，再怀疑应用 |
+| 只看 Prometheus 的 `up` | `up` 只反映抓取目标，不反映日志管道 |
+
+### 修复
+
+```bash
+# 清除错误的 nodeSelector（注意：apply 是 merge，不会删字段，必须显式置空）
+kubectl -n monitoring patch ds fluent-bit --type=merge \
+  -p='{"spec":{"template":{"spec":{"nodeSelector":null}}}}'
+kubectl apply -f k8s/monitoring/75-fluent-bit.yaml
+# 或直接 ./scripts/drills/recover.sh
+```
+
+### 预防：监控日志管道自身
+
+这是本场景最重要的收获——**日志管道也要被监控**：
+
+```promql
+# 1. 采集器是否在线（DaemonSet 期望 vs 就绪）
+kube_daemonset_status_number_ready{daemonset="fluent-bit"}
+  < kube_daemonset_status_desired_number_scheduled{daemonset="fluent-bit"}
+
+# 2. Loki 是否还在收数据（日志速率骤降为 0）
+sum(rate({namespace="sre-lab"}[5m])) == 0
+```
+
+本项目的告警规则里**还没有这两条**，这是一个已知缺口，
+建议加到 `k8s/monitoring/10-prometheus.yaml` 的容量组：
+
+```yaml
+- alert: LogPipelineStalled
+  expr: |
+    sum(rate({namespace=~".+"}[10m])) == 0
+  for: 10m
+  labels:
+    severity: critical
+  annotations:
+    summary: '日志管道可能已中断'
+    description: '近 10 分钟没有收到任何日志，检查 Fluent Bit 与 Loki'
+```
+
+注意：这条规则属于 Loki 数据源，需要放在 Loki 的 ruler 里，
+或者用 Prometheus 的 `kube_daemonset_status_number_ready` 间接监控。
+
+### 对应课
+
+SOP 第 6 课「指标正确性」+ 附录 D。
+
+**核心教训**：**监控系统本身也需要被监控**。
+如果日志是排障的主要手段，那"日志管道挂了"就是一级故障——
+只是它不会自己喊出来。
+
+---
+
 ## 判据速查表
 
 | 现象 | 最先查 | 关键判据 |
@@ -456,6 +654,9 @@ SOP 第 5 课「探针与就绪语义」中的因果链部分。
 | 全部正常但访问不通 | Endpoints | 空 = selector/标签问题 |
 | 全部正常但功能缺失 | `jsonpath` 对比期望配置 | env / volume / probe 是否被丢 |
 | 状态抖动 | 探针参数 | period / timeout / failureThreshold |
+| **指标全绿但日志有 ERROR** | `logs-loki.txt` 的 ERROR 行数 | 错误被应用吞掉，状态码仍是 200 |
+| **日志查不到** | 采集时间 vs 最新日志时间戳 | 差值 > 几分钟 = 管道断了 |
+| **采集器是否存在** | `get pods -l app.kubernetes.io/name=fluent-bit` | 空 = 被驱逐或配置错误 |
 
 ## 通用原则
 

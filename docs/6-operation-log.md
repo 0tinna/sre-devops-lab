@@ -594,3 +594,93 @@ rm k8s/monitoring/70-promtail.yaml
 ```
 
 Promtail 清单已删除，失败原因记入本文档与 SOP 附录 D。
+
+## 16. 2026-11-05 16:55–17:10 演练场景扩展到日志维度
+
+### 16.1 新增两个场景
+
+| 编号 | 场景 | 注入方式 | 现象 |
+| --- | --- | --- | --- |
+| 9 | 日志有 ERROR，指标全绿 | 持续请求 `/simulate/degraded` 15 分钟 | HTTP 全 200，日志 40 条 ERROR，告警 0 |
+| 10 | 日志采集静默中断 | fluent-bit 加不匹配的 nodeSelector | 采集器消失，服务正常，Loki 无新日志 |
+
+### 16.2 应用侧配套改动
+
+新增 `/simulate/degraded` 端点：模拟下游依赖超时被捕获，**降级返回缓存但 HTTP 200**。
+
+```python
+try:
+    raise TimeoutError(f'{upstream} did not respond within {latency:.1f}s')
+except TimeoutError as exc:
+    logger.error('downstream call failed, serving stale cache: %s', exc)
+return jsonify(status='degraded', source='stale-cache', ...)
+```
+
+同时给应用加了 logging 配置（输出到 stdout，格式含时间/级别/logger），
+否则 Fluent Bit 采不到结构化日志。
+
+### 16.3 场景 9 的实测数据
+
+注入 15 分钟持续请求后：
+
+```text
+日志层（logs-loki.txt）:
+  各 Pod ERROR 行数: demo-api-75fb44d974-bz44g = 21, -q8ltp = 19
+  ERROR 样本: "downstream call failed, serving stale cache:
+               inventory-service did not respond within 2.4s"
+  每个 200 响应前都有一行 ERROR
+
+指标层（metrics.txt）:
+  ALERTS{alertstate="firing"}  → (无数据)
+  sum by (pod) (rate(demo_http_requests_total[5m])) → 只有 200，无 5xx
+  histogram_quantile(0.95, ...) = 0.00475   ← P95 仅 4.7ms
+```
+
+**结论**：40 条 ERROR、0 条告警、P95 反而更快（走缓存）。
+这正是"静默降级"的典型特征——**变快也可能是变坏的信号**。
+
+### 16.4 场景 10 的实测数据
+
+```text
+采集时间:     2026-11-05 17:04:23
+最新日志时间: 2026-11-05T17:00:17
+差值:         约 4 分钟          ← 关键判据
+
+sum(up) = 7                       ← Prometheus 抓取正常
+ALERTS  = (无数据)                ← 无告警
+demo-api = 2/2 Running，/healthz 200
+
+kubectl -n monitoring get pods -l app.kubernetes.io/name=fluent-bit
+  → No resources found
+kubectl -n monitoring get ds fluent-bit -o jsonpath='{.spec.template.spec.nodeSelector}'
+  → {"drill-disabled":"true"}
+```
+
+### 16.5 collect.sh 新增日志采集
+
+新文件 `logs-loki.txt`：
+
+```text
+各命名空间的日志量（近 15 分钟）
+sre-lab 各 Pod 的日志量
+ERROR/FATAL 日志行数（按 Pod）
+最近 40 行原始日志
+ERROR 日志样本
+```
+
+排查顺序也更新了：日志证据插在 endpoints 之后、配置对比之前。
+
+### 16.6 暴露的监控缺口
+
+场景 10 证明**日志管道自身没有被监控**。当前 10 条告警规则里没有一条能发现
+"Fluent Bit 挂了"。建议补充（尚未实现）：
+
+```yaml
+- alert: LogCollectorDown
+  expr: |
+    kube_daemonset_status_number_ready{daemonset="fluent-bit"}
+      < kube_daemonset_status_desired_number_scheduled{daemonset="fluent-bit"}
+  for: 5m
+```
+
+这条已记入 `docs/drills/answers.md` 的 S10 预防章节，作为后续任务。
