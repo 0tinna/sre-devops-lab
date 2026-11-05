@@ -34,8 +34,10 @@
 | 7 | [`7-github-push-sop.md`](docs/7-github-push-sop.md) | GitHub 部署密钥与推送 SOP |
 | 8 | [`8-handoff-2026-11-05.md`](docs/8-handoff-2026-11-05.md) | 项目交接摘要：当前状态与待办 |
 | 9 | [`9-interview-pitch.md`](docs/9-interview-pitch.md) | 面试表述与追问应对：30 秒版、可深讲的故事 |
+| 10 | [`10-drill-lab.md`](docs/10-drill-lab.md) | **故障演练实验室**：8 个可注入场景，采集证据自己排查 |
 
-只想知道"现在什么状态"，读 8；想学排查方法，读 2；想准备面试，读 9。
+只想知道"现在什么状态"，读 8；想学排查方法，读 2；想准备面试，读 9；
+**想动手练，直接跑 `./scripts/drills/inject.sh list`**。
 
 ## 架构
 

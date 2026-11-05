@@ -13,6 +13,7 @@
 | [7](7-github-push-sop.md) | GitHub 推送 SOP | 部署密钥、remote 配置、推送排障 | 10 分钟 |
 | [8](8-handoff-2026-11-05.md) | 项目交接摘要 | 当前状态、待办、交接给他人时的完整上下文 | 10 分钟 |
 | [9](9-interview-pitch.md) | 面试表述与追问应对 | 30 秒版 / 2 分钟版、三个可深讲的故事、反问清单 | 20 分钟 |
+| [10](10-drill-lab.md) | **故障演练实验室** | 8 个可注入场景，采集真实现场证据自己排查 | 练习用 |
 
 ## 两套编号，不要混
 
@@ -29,6 +30,7 @@
 | 你要做什么 | 读哪几份 |
 | --- | --- |
 | 准备面试 | [9](9-interview-pitch.md) 先拿结论 → [1](1-manual-from-zero-to-one.md) 补过程 → [2 第 6、7 课](2-troubleshooting-sop.md#第-6-课--指标正确性) 准备深讲的故事 |
+| **练排查** | [10](10-drill-lab.md) 注入场景 + 采集证据 → 自己查 → 对照 [answers](drills/answers.md) |
 | 接手这个项目 | [5](5-cluster-inventory.md) 摸环境 → [8](8-handoff-2026-11-05.md) 看现状 → [3](3-monitoring-runbook.md) 拿监控入口 → [7](7-github-push-sop.md) 配凭证 |
 | 排查线上故障 | 直接跳 [2 附录 B 速查索引](2-troubleshooting-sop.md#附录-b--问题速查索引)，按症状关键词定位到课 |
 | 继续开发 | [4](4-next-phase-plan.md) 拿任务清单 → [3](3-monitoring-runbook.md) 拿验证方法 |

@@ -8,3 +8,7 @@ build/
 *.tar
 *.tar.gz
 
+# 演练现场包是运行时产物（带时间戳、体积大），不进版本库。
+# 需要留存时手动复制到 docs/drills/examples/ 并去掉时间戳。
+docs/drills/cases/
+
