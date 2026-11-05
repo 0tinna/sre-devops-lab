@@ -1,0 +1,185 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit-sre-lab
+rules:
+  - apiGroups: ['']
+    resources:
+      - namespaces
+      - pods
+      - nodes
+      - nodes/proxy
+    verbs: ['get', 'list', 'watch']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit-sre-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit-sre-lab
+subjects:
+  - kind: ServiceAccount
+    name: fluent-bit
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: monitoring
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush              1
+        Log_Level          info
+        Daemon             off
+        Parsers_File       /fluent-bit/etc/parsers.conf
+        HTTP_Server        on
+        HTTP_Listen        0.0.0.0
+        HTTP_Port          2020
+        Health_Check       on
+        HC_Errors_Count    5
+        HC_Retry_Failure_Count 5
+        HC_Period          30
+
+    # 直接读 hostPath 上的容器日志文件，不依赖 API 做文件发现。
+    # 文件名格式：<pod>_<namespace>_<container>-<container-id>.log
+    # kubernetes filter 通过 Kube_Tag_Prefix 从文件名解析元数据。
+    [INPUT]
+        Name                tail
+        Path                /var/log/containers/*.log
+        Exclude_Path        /var/log/containers/*_kube-system_*.log,/var/log/containers/*_kube-flannel_*.log
+        multiline.parser    cri
+        Tag                 kube.*
+        Mem_Buf_Limit       20MB
+        Skip_Long_Lines     On
+        Refresh_Interval    5
+        DB                  /var/lib/fluent-bit/flb.db
+        DB.locking          On
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        Kube_URL            https://kubernetes.default.svc:443
+        Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+        Kube_Tag_Prefix     kube.var.log.containers.
+        Merge_Log           On
+        Merge_Log_Key       log_processed
+        Keep_Log            Off
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude Off
+
+    [OUTPUT]
+        Name                loki
+        Match               kube.*
+        Host                loki.monitoring.svc.cluster.local
+        Port                3100
+        Labels              job=fluent-bit, namespace=$kubernetes['namespace_name'], pod=$kubernetes['pod_name'], container=$kubernetes['container_name'], app=$kubernetes['labels']['app_kubernetes_io_name'], node=$kubernetes['host']
+        Label_Keys          $kubernetes['namespace_name'],$kubernetes['pod_name'],$kubernetes['container_name'],$kubernetes['labels']['app_kubernetes_io_name'],$kubernetes['host']
+        Line_Format         json
+        Retry_Limit         5
+        # 注意：3.1.9 的 loki 插件不支持 Total_Limit_Size / Storage.total_limit_size，
+        # 写了会直接导致 output 初始化失败、容器 CrashLoopBackOff。
+        buffer_size         256KB
+
+  parsers.conf: |
+    [PARSER]
+        Name        cri
+        Format      regex
+        Regex       ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+
+    [PARSER]
+        Name        json
+        Format      json
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: fluent-bit
+    app.kubernetes.io/part-of: sre-devops-lab
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fluent-bit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fluent-bit
+        app.kubernetes.io/part-of: sre-devops-lab
+    spec:
+      serviceAccountName: fluent-bit
+      # 两个节点都要采集，包括带 NoSchedule taint 的 master
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: fluent-bit
+          image: docker.m.daocloud.io/fluent/fluent-bit:3.1.9
+          ports:
+            - name: http
+              containerPort: 2020
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 160Mi
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 5
+          securityContext:
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: config
+              mountPath: /fluent-bit/etc
+              readOnly: true
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: db
+              mountPath: /var/lib/fluent-bit
+      volumes:
+        - name: config
+          configMap:
+            name: fluent-bit-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+        # containerd 集群上这个目录可能不存在，用 DirectoryOrCreate 兜底
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+            type: DirectoryOrCreate
+        - name: db
+          emptyDir:
+            sizeLimit: 64Mi

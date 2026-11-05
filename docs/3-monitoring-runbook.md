@@ -7,16 +7,18 @@
 ## 一、访问入口
 
 ```bash
-# 三个 UI 都只监听 127.0.0.1，必须 port-forward，不要把 9090/3000/9093 暴露到公网
+# 所有 UI 都只监听 127.0.0.1，必须 port-forward，不要把 9090/3000/9093/3100 暴露到公网
 kubectl -n monitoring port-forward svc/prometheus   9090:9090
 kubectl -n monitoring port-forward svc/alertmanager 9093:9093
 kubectl -n monitoring port-forward svc/grafana      3000:3000
+kubectl -n monitoring port-forward svc/loki         3100:3100
 ```
 
 - Prometheus：<http://127.0.0.1:9090>（`/targets` 看抓取，`/alerts` 看规则状态，`/rules` 看规则内容）
 - Alertmanager：<http://127.0.0.1:9093>
 - Grafana：<http://127.0.0.1:3000>，账号 `admin`，口令见 Secret `monitoring/grafana-admin`
   （清单里是 `lab-grafana-change-me`，演示前用下面的命令覆盖）
+- Loki：<http://127.0.0.1:3100>（`/ready` 健康检查，`/loki/api/v1/*` 查询接口）
 
 ```bash
 kubectl -n monitoring create secret generic grafana-admin \
@@ -26,9 +28,58 @@ kubectl -n monitoring create secret generic grafana-admin \
 kubectl -n monitoring rollout restart deploy/grafana
 ```
 
-看板已随 ConfigMap 自动挂载，路径 `SRE Lab / SRE Lab Overview`，13 个面板：
+看板已随 ConfigMap 自动挂载，路径 `SRE Lab / SRE Lab Overview`，15 个面板：
 目标存活、请求速率、5xx 比例、P95、当前 firing 告警、状态码分布、延迟分位、
-Pod 内存/CPU 与 request/limit 对比、节点内存、节点磁盘、副本数、重启次数。
+Pod 内存/CPU 与 request/limit 对比、节点内存、节点磁盘、副本数、重启次数、
+**日志速率（Loki）、错误日志（Loki）**。
+
+### 日志查询（Loki）
+
+```bash
+# 直接查 Loki
+kubectl -n monitoring port-forward svc/loki 3100:3100
+curl -s 'http://127.0.0.1:3100/loki/api/v1/label/namespace/values'
+curl -s --get --data-urlencode 'query={namespace="sre-lab"}' \
+  --data-urlencode "limit=20" \
+  'http://127.0.0.1:3100/loki/api/v1/query_range'
+
+# 只查错误
+curl -s --get --data-urlencode 'query={namespace="sre-lab"} |~ "(?i)error|fail"' \
+  'http://127.0.0.1:3100/loki/api/v1/query_range'
+```
+
+在 Grafana 的 Explore 里选 `Loki` 数据源，可直接按 LogQL 检索：
+
+```logql
+{namespace="sre-lab"}                              # 全部
+{app="demo-api"} |~ "(?i)error"                    # 只看错误
+{namespace="sre-lab"} | json                       # 解出 JSON 字段
+sum by (namespace) (rate({namespace=~".+"}[5m]))   # 日志速率
+```
+
+### 日志采集架构
+
+```text
+各节点 /var/log/containers/*.log
+        |
+        | tail（Fluent Bit DaemonSet，直接扫文件，不依赖 API 做文件发现）
+        v
+   kubernetes filter（补 namespace/pod/container 标签）
+        |
+        v
+   Loki（单机模式，文件系统存储，保留 24h）
+        |
+        v
+   Grafana（Loki 数据源，日志面板 + Explore）
+```
+
+**为什么用 Fluent Bit 而不是 Promtail**：
+Promtail 的 `kubernetes_sd_configs` 在 K8s v1.34.1 上静默失效（0 targets 且无报错），
+2.9.4 和 3.5.0 都测过。Fluent Bit 的 tail input 不依赖 API 做文件发现，实测可用。
+完整排查过程见 `2-troubleshooting-sop.md` 附录 D。
+
+**排除的噪声**：`kube-system` 与 `kube-flannel` 的日志不采集（`Exclude_Path`），
+它们是纯噪声，而且量很大。
 
 ## 二、抓取拓扑
 

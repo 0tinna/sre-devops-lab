@@ -466,3 +466,131 @@ monitoring           6/6 Ready
 告警                 0 条，全部消解
 opsctl health        OK
 ```
+
+## 15. 2026-11-05 16:20–16:50 P4 日志集中化
+
+执行者：Little Code Sauce（经跳板机到 master）
+
+目标：补上可观测性最大的缺口——日志此前只能 `kubectl logs` 手工看，没有集中收集与检索。
+
+### 15.1 方案选型与踩坑过程
+
+| 步骤 | 尝试 | 结果 |
+| --- | --- | --- |
+| 1 | 拉取 `grafana/loki:2.9.4` + `grafana/promtail:2.9.4` | 成功（66s / 143s） |
+| 2 | 部署 Loki 单机 + Promtail DaemonSet | Loki 起来了，**Promtail 永远 0/1 NotReady** |
+| 3 | 从 Promtail 日志定位 | `Not ready: Unable to find any logs to tail` |
+| 4 | 验证挂载与 glob | 容器内 `ls /var/log/pods` 正常，手工 glob 能匹配到文件 |
+| 5 | 用 `static_configs` 最小配置测试 | **target=1、ready 200、tail 正常启动** |
+| 6 | 换 Promtail 3.5.0 重试 `kubernetes_sd_configs` | 仍然 0 targets |
+| 7 | 验证 RBAC / DNS / token / API 访问 | 全部正常：`kubectl auth can-i` = yes，容器内 openssl 直连 API 返回 `HTTP/1.1 200 OK` 和完整 PodList |
+| 8 | 判定 | **Promtail 的 `kubernetes_sd_configs` 在 K8s v1.34.1 上静默失效**（无任何报错） |
+| 9 | 改用 Fluent Bit 3.1.9 | kubernetes filter 日志显示 `connectivity OK` / `local POD info OK` |
+| 10 | 修正不支持的配置项 | `total_limit_size` 导致 output 初始化失败，删除后正常 |
+
+### 15.2 关键证据：Promtail 的静默失效
+
+同一套配置下，唯一差别是 `static_configs` 还是 `kubernetes_sd_configs`：
+
+```text
+static_configs        → promtail_targets_active_total 1, ready 200, tail 正常
+kubernetes_sd_configs → promtail_targets_active_total 0, ready 500, 无任何错误日志
+```
+
+而容器内直连 API 是通的：
+
+```bash
+# 在 promtail 容器里用 openssl 手工发请求
+GET /api/v1/namespaces/sre-lab/pods?limit=1
+→ HTTP/1.1 200 OK
+→ {"kind":"PodList", ... "items":[{"metadata":{"name":"demo-api-74d4c55f69-k6xht",...}}]}
+```
+
+**网络通、认证通、API 通，但 discovery 就是不返回 target，也不报错。**
+
+这是最难的一类故障：`/service-discovery` 页面显示 `kubernetes-pods (0/0 active targets)`，
+日志里连一条 error 都没有。
+
+### 15.3 最终方案：Fluent Bit
+
+| 对比项 | Promtail | Fluent Bit |
+| --- | --- | --- |
+| 文件发现 | 依赖 `kubernetes_sd_configs`（本项目失效） | `tail` 直接读 `/var/log/containers/*.log` |
+| K8s 1.34 兼容 | ❌ | ✅ |
+| 日志元数据 | SD 提供 | `kubernetes` filter + tag 解析 |
+| 镜像大小 | 75MB | 约 50MB |
+
+**关键差异**：Fluent Bit 用 `tail` input 直接扫文件，**不依赖 API 做文件发现**，
+元数据由 `kubernetes` filter 补充（这一步实测正常）。所以即使 SD 类方案有问题，
+Fluent Bit 仍能工作——这也是它更稳的原因。
+
+配置要点：
+
+```ini
+[INPUT]
+    Name tail
+    Path /var/log/containers/*.log
+    Exclude_Path /var/log/containers/*_kube-system_*.log,/var/log/containers/*_kube-flannel_*.log
+    multiline.parser cri
+    Tag kube.*
+    DB /var/lib/fluent-bit/flb.db
+
+[FILTER]
+    Name kubernetes
+    Kube_Tag_Prefix kube.var.log.containers.   # 从文件名解析 ns/pod/container
+    Merge_Log On
+
+[OUTPUT]
+    Name loki
+    Host loki.monitoring.svc.cluster.local
+    Labels job=fluent-bit, namespace=$kubernetes['namespace_name'], ...
+```
+
+### 15.4 第二个坑：ConfigMap 变更不会重启 Grafana
+
+加完 Loki 数据源后，`kubectl apply` 显示 ConfigMap configured，
+但 Grafana 里**只有 Prometheus 一个数据源**。
+
+原因：ConfigMap 内容变化不会触发引用它的 Deployment 滚动更新
+（除非在 Pod template 上挂 checksum 注解）。必须显式重启：
+
+```bash
+kubectl -n monitoring rollout restart deploy/grafana
+```
+
+**这个坑和第 9 课的 `set image` 是同一类问题**：改了配置但没让工作负载重新加载。
+
+### 15.5 部署结果
+
+| 组件 | 状态 | 资源 |
+| --- | --- | --- |
+| Loki 2.9.4 | 1/1 Running | req 100m/192Mi，lim 500m/512Mi |
+| Fluent Bit 3.1.9 | 2/2 Running（双节点） | 各 req 50m/64Mi，lim 200m/160Mi |
+| Grafana 数据源 | Prometheus + Loki 双源 | — |
+| 看板面板 | 13 → **15**（+日志速率 +错误日志） | — |
+
+监控栈总资源：requests `490m / 928Mi`，limits `2400m / 2112Mi`，master 仍余 14 GiB。
+
+### 15.6 验证
+
+```text
+Loki /loki/api/v1/labels  → container, filename, job, kubernetes_*, namespace, node, pod
+namespace 值              → ["monitoring", "sre-lab"]
+查询 {namespace="sre-lab"} → 2 条流（两个 demo-api pod），近 5 分钟 62 行
+Grafana 代理查 Loki        → {"status":"success","data":["monitoring","sre-lab"]}
+```
+
+Grafana 面板可直接检索：
+- 「日志速率（Loki，按命名空间）」— `sum by (namespace) (rate({namespace=~"$namespace"}[5m]))`
+- 「错误日志」— `{namespace=~"$namespace"} |~ "(?i)error|fail|exception|panic|fatal"`
+
+### 15.7 清理
+
+```bash
+kubectl -n monitoring delete ds promtail
+kubectl -n monitoring delete sa promtail cm promtail-config
+kubectl delete clusterrole promtail-sre-lab clusterrolebinding promtail-sre-lab
+rm k8s/monitoring/70-promtail.yaml
+```
+
+Promtail 清单已删除，失败原因记入本文档与 SOP 附录 D。

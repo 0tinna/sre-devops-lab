@@ -1304,3 +1304,112 @@ kubectl -n <ns> rollout history deploy/<name>
 4. **区分「服务不可用」和「监控说服务不可用」。** 第 6、7 课都属于后者，服务其实健康。
 5. **修复时想清为什么会发生。** 第 3 课的预防是"永远用数字 UID"，不是"这次改成 10001"。
 6. **把结论写回代码注释。** 第 5 课的端点分布写在 YAML 里，下次不用再探一遍。
+
+---
+
+## 附录 D · 工具与集群版本兼容性（真实案例）
+
+**这一节讲的是"用对方法也修不好"的一类问题**：工具本身有 bug 或与集群版本不兼容，
+所有配置都正确、所有权限都正常，但它就是不工作，而且**不报错**。
+
+### D.1 现象
+
+部署 Promtail 采集 K8s 日志，Pod 状态：
+
+```text
+Running 但 READY 0/1
+logs: Not ready: Unable to find any logs to tail. Please verify permissions, volumes, scrape_config, etc.
+promtail_targets_active_total 0
+/service-discovery 页面: kubernetes-pods (0/0 active targets)
+```
+
+日志里**没有任何 error**，只有这句"找不到可 tail 的日志"。
+
+### D.2 你以为的原因（都在第 5 课的常规套路里）
+
+按顺序排除了所有常见原因：
+
+| 检查项 | 结果 |
+| --- | --- |
+| hostPath 挂载 | `/var/log/pods` 在容器内可读，能看到所有 pod 目录 |
+| 文件路径 glob | 容器内手工 `ls /var/log/pods/*<uid>/*/*.log` 能匹配到文件 |
+| RBAC 权限 | `kubectl auth can-i list pods --as=system:serviceaccount:monitoring:promtail -A` → **yes** |
+| DNS 解析 | `getent hosts kubernetes.default.svc` → `10.96.0.1` |
+| SA token | `/var/run/secrets/kubernetes.io/serviceaccount/token` 存在 |
+| API 连通性 | 容器内 openssl 直连返回 `HTTP/1.1 200 OK` + 完整 PodList |
+
+**全部正常，但 discovery 就是 0 targets。**
+
+### D.3 决定性的二分实验
+
+换一种 `scrape_configs`，其他全不变：
+
+| 配置方式 | 结果 |
+| --- | --- |
+| `static_configs` + 固定 `__path__` glob | **target=1，ready 200，tail 正常启动** |
+| `kubernetes_sd_configs` + relabel 拼 `__path__` | target=0，ready 500 |
+
+**同一份二进制、同样的挂载、同样的权限，只有 discovery 方式不同。**
+结论：Promtail（2.9.4 和 3.5.0 都测了）的 `kubernetes_sd_configs`
+在 K8s **v1.34.1** 上静默失效。
+
+### D.4 处置
+
+换成 **Fluent Bit 3.1.9**。它的 `tail` input 直接扫 `/var/log/containers/*.log`，
+**不依赖 API 做文件发现**，元数据用 `kubernetes` filter 补（这一步实测正常）：
+
+```ini
+[INPUT]
+    Name tail
+    Path /var/log/containers/*.log
+    Tag kube.*
+[FILTER]
+    Name kubernetes
+    Kube_Tag_Prefix kube.var.log.containers.
+```
+
+启动日志直接给出判据：
+
+```text
+[filter:kubernetes] connectivity OK
+[filter:kubernetes] local POD info OK
+[input:tail:tail.0] inotify_fs_add(): ... name=/var/log/containers/demo-api-xxx.log
+```
+
+### D.5 判断流程（遇到"怎么配都不工作"时）
+
+```text
+① 有没有明确的错误？       有 → 按错误查（常规路径）
+② 没有错误但功能缺失       → 进入 ③
+③ 做二分实验：
+     把可疑组件换成最简可用配置（static / 硬编码 / 无过滤器）
+     能工作 → 问题在那个特性，不在组件本身
+     也不能 → 问题在环境（网络/权限/挂载）
+④ 查版本兼容性：
+     集群版本 vs 工具版本
+     工具的 client-go / SDK 版本
+⑤ 换实现：同类工具通常有 2-3 个可选，别在一棵树上吊死
+```
+
+### D.6 关键教训
+
+| 教训 | 说明 |
+| --- | --- |
+| **"没报错"不等于"没问题"** | 这类 bug 只表现在功能缺失上，日志干净得很 |
+| **二分是最快的定位手段** | 换一个变量做对比，比读源码快得多 |
+| **不要假设官方组件一定适配** | K8s 小版本迭代快，采集类工具的兼容性常落后 |
+| **保留证据再换方案** | 记下"什么配置 + 什么版本 + 什么结果"，否则换完就说不清了 |
+
+### D.7 同类风险清单
+
+| 场景 | 常见坑 |
+| --- | --- |
+| Promtail / Alloy 的 K8s SD | 新版本 K8s 上 discovery 失效 |
+| 老版 client-go 的 operator | 新 K8s 的 CRD 字段解析失败 |
+| Fluent Bit 的插件参数 | 版本间参数改名，写错直接 CrashLoop（本项目也踩了 `total_limit_size`） |
+| Helm chart 的 apiVersion | 老 chart 用已废弃的 API 版本 |
+| 监控 exporter 的指标名 | 版本升级后指标改名，告警表达式失效 |
+
+**共同点**：都是"配置看起来对、但版本不匹配"，报错信息通常指向别处。
+
+---

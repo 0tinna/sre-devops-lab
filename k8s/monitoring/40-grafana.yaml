@@ -30,6 +30,17 @@ data:
         editable: false
         jsonData:
           timeInterval: 15s
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki.monitoring.svc.cluster.local:3100
+        isDefault: false
+        editable: false
+        jsonData:
+          maxLines: 1000
+          # 从日志里的 traceId 关联到指标时用，本项目暂未接入 tracing
+          timeout: 60
 ---
 apiVersion: apps/v1
 kind: Deployment

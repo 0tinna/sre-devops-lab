@@ -254,6 +254,44 @@ data:
               "legendFormat": "{{pod}}/{{container}}"
             }
           ]
+        },
+        {
+          "id": 50,
+          "type": "timeseries",
+          "title": "日志速率（Loki，按命名空间）",
+          "description": "由 Loki 直接聚合 Fluent Bit 推送的日志行数",
+          "gridPos": { "h": 6, "w": 12, "x": 0, "y": 36 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "fieldConfig": { "defaults": { "unit": "logs", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (namespace) (rate({namespace=~\"$namespace\"}[5m]))",
+              "legendFormat": "{{namespace}}"
+            }
+          ]
+        },
+        {
+          "id": 51,
+          "type": "logs",
+          "title": "错误日志（含 error/fail/exception）",
+          "description": "点开可看完整行；上方时间范围控制检索窗口",
+          "gridPos": { "h": 12, "w": 24, "x": 0, "y": 42 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "options": {
+            "showTime": true,
+            "showLabels": false,
+            "wrapLogMessage": true,
+            "sortOrder": "Descending",
+            "enableLogDetails": true
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "{namespace=~\"$namespace\"} |~ \"(?i)error|fail|exception|panic|fatal\"",
+              "legendFormat": ""
+            }
+          ]
         }
       ]
     }

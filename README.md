@@ -45,17 +45,18 @@
 GitHub Actions                      monitoring 命名空间（全部固定在 master）
     |                                 +-- Prometheus（抓取 7 个 target）
     | 构建并推送                      +-- Alertmanager（10 条规则的路由）
-    v                                 +-- Grafana（数据源 + 看板自动 provisioned）
+    v                                 +-- Grafana（数据源 + 15 面板自动 provisioned）
 GHCR 镜像                             +-- node-exporter（DaemonSet，hostPort 9100）
     |                                 +-- kube-state-metrics
-    v
-Kubernetes 命名空间 sre-lab
+    v                                 +-- Loki（日志存储，保留 24h）
+Kubernetes 命名空间 sre-lab           +-- Fluent Bit（DaemonSet，采集容器日志）
     +-- Deployment demo-api（2 副本）  <-- prometheus 通过 Pod 注解自动发现
-    +-- Service demo-api（ClusterIP）
+    +-- Service demo-api（ClusterIP）  <-- fluent-bit tail /var/log/containers
 ```
 
 实验集群为 1 个控制面节点 + 1 个工作节点。工作节点约 3.6 GiB 内存，所以监控栈全部
-`nodeSelector` 到 master 并加 control-plane taint 的 toleration，总请求 290m CPU / 608Mi 内存。
+`nodeSelector` 到 master 并加 control-plane taint 的 toleration，
+总请求 490m CPU / 928Mi 内存。
 
 ## 当前集群
 
