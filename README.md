@@ -11,39 +11,59 @@
 ## 项目内容
 
 - Flask 示例 API，提供 `/healthz`、`/readyz`、`/metrics`、`/api/orders`
-- 受控故障接口：`/simulate/error`、`/simulate/slow`
+- 受控故障接口：`/simulate/error`、`/simulate/slow`、`/simulate/memory`（默认关闭，`ENABLE_FAULT_ENDPOINTS=1` 开启）
+- gunicorn 多 worker + `prometheus_client` multiprocess 模式，避免计数器在 worker 间抖动
 - 多阶段 Dockerfile，容器以非 root 用户运行
 - Kubernetes Deployment 与 Service，包含探针、资源限制和安全上下文
 - GitHub Actions：校验代码、运行测试、构建并推送 GHCR
-- `scripts/opsctl.py`：集群盘点、健康检查、日志收集、发布和回滚
-- `docs/cluster-inventory.md`：真实集群盘点记录
-- `docs/github-push-sop.md`：GitHub 部署密钥与推送 SOP
-- `docs/manual-from-zero-to-one.md`：完全由个人操作的从 0 到 1 实践手册
+- Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics，10 条告警规则与开箱即用的看板
+- `scripts/opsctl.py`：集群盘点、健康检查、日志收集、发布、回滚、监控自检
+
+## 文档
+
+完整索引见 [`docs/README.md`](docs/README.md)。推荐阅读顺序：
+
+| 顺序 | 文档 | 内容 |
+| --- | --- | --- |
+| 1 | [`docs/manual-from-zero-to-one.md`](docs/manual-from-zero-to-one.md) | 从 0 到 1 实践手册：这个项目怎么搭起来的 |
+| 2 | [`docs/troubleshooting-sop.md`](docs/troubleshooting-sop.md) | **9 节课的故障排查 SOP**，真实问题提炼 |
+| 3 | [`docs/monitoring-runbook.md`](docs/monitoring-runbook.md) | 监控访问、10 条告警清单、D1–D8 演练步骤 |
+| 4 | [`docs/next-phase-plan.md`](docs/next-phase-plan.md) | 下一阶段计划与实测证据 |
+| 5 | [`docs/cluster-inventory.md`](docs/cluster-inventory.md) | 硬件、网络、已装组件的事实基线 |
+| 6 | [`docs/operation-log.md`](docs/operation-log.md) | 每个动作的时间线与执行者 |
+
+辅助文档：
+
+- [`docs/github-push-sop.md`](docs/github-push-sop.md)：GitHub 部署密钥与推送 SOP
+- [`docs/handoff-2026-11-05.md`](docs/handoff-2026-11-05.md)：项目交接摘要（含面试表述）
 
 ## 架构
 
 ```text
-GitHub Actions
-    |
-    | 构建并推送
-    v
-GHCR 镜像
-    |
+GitHub Actions                      monitoring 命名空间（全部固定在 master）
+    |                                 +-- Prometheus（抓取 7 个 target）
+    | 构建并推送                      +-- Alertmanager（10 条规则的路由）
+    v                                 +-- Grafana（数据源 + 看板自动 provisioned）
+GHCR 镜像                             +-- node-exporter（DaemonSet，hostPort 9100）
+    |                                 +-- kube-state-metrics
     v
 Kubernetes 命名空间 sre-lab
-    +-- Deployment demo-api（2 副本）
+    +-- Deployment demo-api（2 副本）  <-- prometheus 通过 Pod 注解自动发现
     +-- Service demo-api（ClusterIP）
 ```
 
-实验集群为 1 个控制面节点 + 1 个工作节点。工作节点约 3.6 GiB 内存，因此监控组件必须设置较小的 requests 和 limits。
+实验集群为 1 个控制面节点 + 1 个工作节点。工作节点约 3.6 GiB 内存，所以监控栈全部
+`nodeSelector` 到 master 并加 control-plane taint 的 toleration，总请求 290m CPU / 608Mi 内存。
 
 ## 当前集群
 
 - master：172.31.6.211，控制面节点，4 vCPU / 15 GiB / 178 GiB
-- node：172.31.12.103，工作节点，3.6 GiB / 50 GiB
+- node：172.31.12.103，工作节点，2 vCPU / 3.6 GiB / 50 GiB
 - Kubernetes：v1.34.1
-- 网络：Docker Hub 不可达，GHCR 可达
-- 当前 `demo-api` Deployment 为 2/2 Running，镜像为 `ghcr.io/0tinna/sre-devops-lab:652760f...`；没有存储类和监控组件
+- 网络：Docker Hub 不可达，quay.io blob 超时，GHCR 可达，`docker.m.daocloud.io` 与 `k8s.m.daocloud.io` 可用
+- `demo-api` Deployment 2/2 Running，镜像 `ghcr.io/0tinna/sre-devops-lab:652760f...`
+- `monitoring` 命名空间已部署（Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics），7 个 target 全部 up
+- 存储：没有 StorageClass，Prometheus 与 Grafana 使用 emptyDir，历史数据不持久
 
 ## 快速开始
 
@@ -98,9 +118,15 @@ python3 scripts/opsctl.py health
 python3 scripts/opsctl.py logs <pod-name>
 python3 scripts/opsctl.py deploy ghcr.io/0tinna/sre-devops-lab:<sha>
 python3 scripts/opsctl.py rollback
+python3 scripts/opsctl.py monitoring
+python3 scripts/opsctl.py monitoring --query 'sum(up)'
 ```
 
 当健康检查失败时，CLI 会返回非零退出码，后续可以接入 CI 或定时巡检。
+
+`monitoring` 子命令刻意不依赖 port-forward：普通检查直接读 Pod Ready 状态；
+只有显式传 `--query` 时才通过 apiserver 的 service proxy 打 Prometheus HTTP API，
+少开一个网络入口，也便于在无浏览器的 SSH 会话里查指标。
 
 ## 受控故障演练
 
@@ -123,10 +149,13 @@ kubectl -n sre-lab rollout undo deployment/demo-api
 
 ### 应用错误与慢请求
 
+故障端点默认关闭，只有容器环境变量 `ENABLE_FAULT_ENDPOINTS=1` 时可用（`k8s/app.yaml` 已按实验环境开启）。关闭时返回 404。
+
 ```bash
 kubectl -n sre-lab port-forward svc/demo-api 8080:80
 curl -i http://127.0.0.1:8080/simulate/error
 curl -i http://127.0.0.1:8080/simulate/slow
+curl -i 'http://127.0.0.1:8080/simulate/memory?mib=512&hold=60'   # 演练 OOMKilled
 ```
 
 ### Pod 自愈
@@ -138,16 +167,33 @@ kubectl -n sre-lab get pods -w
 
 ## 下一阶段
 
-使用较小的资源占用部署 Prometheus、Grafana 和 Alertmanager，并配置以下告警：
+详细拆分、验收标准与实测证据见 `docs/next-phase-plan.md`。
+
+监控清单已落在 `k8s/monitoring/`（未 apply），包含 Prometheus、Alertmanager、node-exporter、kube-state-metrics、Grafana，以及 10 条告警规则：
 
 - 监控目标不可用
 - 5xx 比例过高
 - P95 延迟过高
 - Pod 重启过于频繁
 - Deployment 可用副本不足
-- 节点磁盘或内存压力
+- 容器 OOM 被杀
+- 节点内存、磁盘、CPU 压力
 
 在告警真正触发并被处理之前，不要把它称为完整的监控体系。
+
+## 监控清单
+
+```bash
+kubectl apply -f k8s/monitoring/
+kubectl -n monitoring get pods
+kubectl -n monitoring port-forward svc/prometheus 9090:9090    # /targets 检查抓取
+kubectl -n monitoring port-forward svc/alertmanager 9093:9093  # 查看 firing 告警
+kubectl -n monitoring port-forward svc/grafana 3000:3000       # 默认 admin / lab-grafana-change-me
+```
+
+调度约束：监控组件全部固定在 master（`nodeSelector: kubernetes.io/hostname=master` 加 control-plane taint 的 toleration），因为工作节点只有 3.6 GiB；Prometheus 用 emptyDir，`retention.time=6h`，集群没有 StorageClass。
+
+镜像源：Docker Hub 与 quay.io 在本环境不可靠，Prometheus/Grafana 走 `docker.m.daocloud.io` 代理，kube-state-metrics 走 `registry.k8s.io`。
 
 ## 面试表达
 

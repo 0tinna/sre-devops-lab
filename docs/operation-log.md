@@ -1,4 +1,4 @@
-# 操作审计记录
+﻿# 操作审计记录
 
 记录日期：2026-10-29
 
@@ -206,3 +206,100 @@ kubectl get namespace sre-lab
 - `写操作` 会改变本地文件、Git 仓库或集群状态。
 
 任何会创建 Kubernetes 资源、安装组件、修改权限或推送代码的操作，都会在 SOP 中单独标注，并说明预期结果和回滚方式。
+
+## 10. 2026-11-05 监控阶段
+
+执行者：Little Code Sauce（本地 + 经跳板机 1.95.123.118 到 master 172.31.6.211）
+
+### 10.1 只读复核
+
+| 序号 | 位置 | 操作 | 结果 |
+| --- | --- | --- | --- |
+| 35 | master | `kubectl get nodes/pods/deploy` | 两节点 Ready，demo-api 2/2 Running，0 重启，已稳定 6 天 |
+| 36 | master | 节点 allocatable 与已用资源 | master 4C/15.5GiB，已用 950m CPU、290Mi 内存；node 2C/3.6GiB，内存 request 占 14% |
+| 37 | master | `kubectl describe nodes` 看 taint | master 带 `control-plane:NoSchedule` |
+| 38 | master | 存储与插件检查 | 无 StorageClass/PV/PVC，无 metrics-server，无 helm |
+| 39 | master | 各 registry 可达性 | Docker Hub 超时；quay.io API 通但 blob 下载 60s 超时；ghcr.io 正常；`docker.m.daocloud.io` 可用；`registry.k8s.io` 会 307 到 `europe-west3-docker.pkg.dev`，本环境 DNS 解析失败 |
+
+### 10.2 镜像预拉取（写操作：仅填充本地镜像缓存）
+
+| 镜像 | 耗时 | 结果 |
+| --- | --- | --- |
+| `docker.m.daocloud.io/prom/alertmanager:v0.28.1` | 58s | OK |
+| `docker.m.daocloud.io/prom/node-exporter:v1.9.1` | 16s | OK |
+| `docker.m.daocloud.io/prom/prometheus:v3.6.0` | 114s | OK |
+| `docker.m.daocloud.io/grafana/grafana:12.2.0` | 218s | OK |
+| `k8s.m.daocloud.io/kube-state-metrics/kube-state-metrics:v2.16.0` | 25s | OK（`registry.k8s.io` 直连失败后改走 daocloud 的 k8s 源） |
+
+### 10.3 部署监控栈（写操作）
+
+清单在 `k8s/monitoring/`，全部先通过 `kubectl apply --dry-run=client` 校验，再 apply 到 `monitoring` 命名空间。
+
+| 组件 | 调度 | 资源上限 | 结果 |
+| --- | --- | --- | --- |
+| Prometheus v3.6.0 | master | 500m / 512Mi | Running |
+| Alertmanager v0.28.1 | master | 200m / 128Mi | Running |
+| kube-state-metrics v2.16.0 | master | 300m / 256Mi | Running |
+| Grafana 12.2.0 | master | 300m / 256Mi | Running |
+| node-exporter v1.9.1 | 两个节点 | 各 100m / 64Mi | 2/2 Running |
+
+### 10.4 过程中定位并修复的两个问题
+
+**问题 1：kube-state-metrics 永远 NotReady，Service 没有 Endpoint**
+
+- 现象：Pod Running 但 `0/1 READY`，Events 里 `Readiness probe failed: statuscode: 404`。
+- 排查：用临时 busybox Pod 直连 `10.244.0.6` 逐端口逐路径探测。
+- 实测端点分布：`8080` 上 `/healthz`=200、`/livez`=200、`/readyz`=404；`8081` 上 `/readyz`=200、`/healthz`=404。
+- 根因：就绪探针写成了 `8081/healthz`，该路径在 telemetry 端口不存在。
+- 修复：readiness 改 `telemetry/readyz`，liveness 用 `http-metrics/livez`，并把结论写进清单注释，避免下次再猜。
+
+**问题 2：5xx 比例告警永远不触发（真实缺陷，尚未随镜像发布）**
+
+- 现象：注入 720 次 500 后，Prometheus 里 5xx 比例只有 0.0006，告警不 Pending。
+- 证据：`demo_http_requests_total{path="/readyz"}` 的区间取值在两个值之间反复跳：`53536 → 66702 → 53542 → 66708`，12 个采样点里 3 次回退。
+- 根因：gunicorn 起 2 个 worker，`prometheus_client` 没开 multiprocess 模式，每个 worker 各持一份计数器；`/metrics` 每次只会返回命中的那个 worker，Prometheus 因此看到伪 reset，`rate()`/`increase()` 结果失真（实测算出 1366 req/s，而真实探针速率约 0.1 req/s）。
+- 修复（已落代码，待随镜像发布）：`app/gunicorn.conf.py` 增加 `child_exit` 清理 mmap；`app.py` 在设置 `PROMETHEUS_MULTIPROC_DIR` 时用 `MultiProcessCollector` 聚合；Dockerfile 与 Deployment 提供该目录的 emptyDir；启动命令先清空残留文件。
+- 同时改进告警表达式：5xx 比例的分母排除 `/healthz|/readyz|/metrics`，避免探针的高频 200 稀释业务错误率。
+
+### 10.5 已验证的监控能力
+
+| 项目 | 证据 |
+| --- | --- |
+| 抓取 | 7 个 target 全部 `up`（prometheus、alertmanager、2×demo-api、2×node-exporter、kube-state-metrics） |
+| 规则加载 | 3 组共 10 条，`health=ok`，无语法错误 |
+| 规则热重载 | `POST /-/reload` 返回 200，改 ConfigMap 后无需重启 Pod |
+| Grafana | `/api/health` 返回 ok；数据源 `Prometheus`(uid=prometheus) 自动 provisioned；看板 `SRE Lab / SRE Lab Overview` 13 个面板，无需手工导入 |
+
+## 11. 2026-11-05 未执行的操作
+
+| 项目 | 原因 |
+| --- | --- |
+| `git commit` / `git push` | 按约定由你确认后执行；改动已同步到 master 的 `/opt/sre-devops-lab` 工作区（未提交） |
+| 重新构建应用镜像 | 依赖上一条的 CI 触发，`/simulate/memory` 与 multiprocess 修复都在新镜像里 |
+| OOMKilled 演练（D5） | 依赖新镜像的 `/simulate/memory` 端点 |
+| self-hosted runner | P3 内容，尚未开始 |
+| `kubectl delete` 清理 | 保留用于演示 |
+
+## 12. 2026-11-05 排查 SOP 归档
+
+本轮所有真实问题已整理成 `docs/troubleshooting-sop.md`，共 14 条（TS-01 下含 3 个子类）：
+
+| 编号 | 问题 | 归档内容 |
+| --- | --- | --- |
+| TS-01 | 镜像拉不下来 | 四类根因判别表 + 各镜像源实测状态 + 预拉取耗时 |
+| TS-01a | DNS 解析失败 | `registry.k8s.io` → `europe-west3-docker.pkg.dev` 解析失败，改 `k8s.m.daocloud.io` |
+| TS-01b | blob 下载超时 | "manifest 通 ≠ blob 通"，必须用 `crictl pull` 实测 |
+| TS-01c | 权限/标签错误 | 401/403/404 判别方法 |
+| TS-02 | `CreateContainerConfigError` | 关键判据：Events 里有 `Pulled` 就不是拉取问题 |
+| TS-03 | Running 但 NotReady | kube-state-metrics 端点实测分布 + 临时 Pod 逐端口探测法 |
+| TS-04 | 计数器 worker 抖动 | `query_range` 找回退、multiprocess 三处修复、单 worker 止血方案 |
+| TS-05 | 错误率被探针稀释 | 分母排除探针端点 + 加 `> 0` 防 0/0 |
+| TS-06 | 告警不消解 | 长窗口 `increase[15m]` 收敛慢属正常，附判别表 |
+| TS-07 | dry-run 报 namespace 不存在 | client / server 两种校验级别的用途区分 |
+| TS-08 | 监控栈调度 | taint 与 allocatable 量化决策，DaemonSet 用无 key toleration |
+| TS-09 | 跨跳板机传文件 | 两层 ssh + base64，含批量脚本 |
+| TS-10 | PowerShell 拼接长命令失败 | 四层引号转义的规避策略 |
+| TS-11 | ACL 拒绝写入 | 换用户目录，不硬碰系统目录权限 |
+
+文档同时给出通用排查模型（分层 → 权威证据 → 可证伪测量 → 最小改动 → 同组测量验证 → 记录）、
+诊断命令速查表和复盘方法论。
