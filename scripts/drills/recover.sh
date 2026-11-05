@@ -32,6 +32,18 @@ sed "s|image: ghcr.io/0tinna/sre-devops-lab:latest|image: ghcr.io/0tinna/sre-dev
 kubectl apply -f /tmp/app-recover.yaml
 
 echo
+echo "--- 2b. 恢复日志采集器（场景 10 的 nodeSelector）---"
+if [ -f k8s/monitoring/75-fluent-bit.yaml ]; then
+  # apply 是 merge，不会删除清单里没有的字段，所以 nodeSelector 必须显式置空
+  kubectl -n monitoring patch ds fluent-bit --type=merge \
+    -p='{"spec":{"template":{"spec":{"nodeSelector":null}}}}' >/dev/null 2>&1 || true
+  kubectl apply -f k8s/monitoring/75-fluent-bit.yaml >/dev/null 2>&1
+  kubectl -n monitoring rollout status ds/fluent-bit --timeout=180s 2>&1 | tail -1
+else
+  echo "    (未找到 fluent-bit 清单，跳过)"
+fi
+
+echo
 echo "--- 3. 等待就绪 ---"
 if kubectl -n "$NS" rollout status deploy/"$DEPLOY" --timeout=300s; then
   echo "    rollout 成功"
@@ -44,7 +56,7 @@ fi
 
 echo
 echo "--- 4. 清理可能残留的演练 Pod ---"
-kubectl -n "$NS" delete pod loadgen slowgen drill-probe --ignore-not-found 2>/dev/null || true
+kubectl -n "$NS" delete pod loadgen slowgen drill-probe degradedgen --ignore-not-found 2>/dev/null || true
 
 echo
 echo "--- 5. 验证配置完整性（这是恢复成功的真正判据）---"

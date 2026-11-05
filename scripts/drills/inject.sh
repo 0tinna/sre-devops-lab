@@ -25,19 +25,24 @@ declare -A SCENARIOS=(
   [6]="readiness 超时时间被设得极短"
   [7]="用 set image 发布，导致 env/volume 配置丢失"
   [8]="Service 的 selector 与服务端标签不匹配"
+  [9]="日志里持续出现 ERROR，但指标全绿"
+  [10]="日志采集静默中断，服务与指标都正常"
 )
 
 list_scenarios() {
   echo "可用场景："
-  for i in $(seq 1 8); do
+  for i in $(seq 1 10); do
     echo "  $i) ${SCENARIOS[$i]}"
   done
   echo
+  echo "  1-8  面向指标与状态：Pod 状态、探针、调度、配置"
+  echo "  9-10 面向日志：日志与指标不一致、采集链路断裂"
+  echo
   echo "注入后建议流程："
-  echo "  1. ./scripts/drills/collect.sh <编号>   采集现场证据"
+  echo "  1. ./scripts/drills/collect.sh <编号>   采集现场证据（含 Loki 日志）"
   echo "  2. 按 SOP 九课的顺序排查（docs/2-troubleshooting-sop.md）"
   echo "  3. ./scripts/drills/recover.sh          恢复"
-  echo "  4. 对照 docs/drills/answers/ 检查你的判断"
+  echo "  4. 对照 docs/drills/answers.md 检查你的判断"
 }
 
 wait_rollout() {
@@ -124,6 +129,48 @@ case "$SCENARIO" in
       {"op":"replace","path":"/spec/selector","value":{"app.kubernetes.io/name":"demo-api-v2"}}
     ]'
     echo "已注入。预计 Service 找不到后端。"
+    ;;
+
+  9)
+    # 持续请求 /simulate/degraded：HTTP 响应永远是 200，但应用日志里会打 ERROR。
+    # 指标层面看不到任何异常——这正是本场景要练的"日志与指标不一致"。
+    kubectl -n "$NS" delete pod degradedgen --ignore-not-found >/dev/null 2>&1
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: degradedgen
+  namespace: $NS
+  labels:
+    drill: "9"
+spec:
+  restartPolicy: Never
+  containers:
+    - name: c
+      image: docker.m.daocloud.io/library/busybox:1.36
+      command: ["sh","-c"]
+      args:
+        - |
+          end=\$(( \$(date +%s) + 900 ))
+          while [ \$(date +%s) -lt \$end ]; do
+            wget -q -O /dev/null http://demo-api.sre-lab.svc.cluster.local/simulate/degraded 2>/dev/null
+            sleep 2
+          done
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {cpu: 100m, memory: 32Mi}
+EOF
+    echo "已注入。所有请求返回 HTTP 200，但应用日志里会持续出现 ERROR。"
+    echo "关注点：指标层面的 5xx / 延迟是否会有变化。"
+    ;;
+
+  10)
+    # 让 Fluent Bit 不匹配任何节点：Pod 消失，日志上传中断，但服务与指标完全正常。
+    # 用 nodeSelector 而不是删 DaemonSet，这样 recover.sh 一条 apply 就能还原。
+    kubectl -n monitoring patch ds fluent-bit --type=merge \
+      -p='{"spec":{"template":{"spec":{"nodeSelector":{"drill-disabled":"true"}}}}}'
+    echo "已注入。日志采集器将从两个节点消失。"
+    echo "关注点：服务是否受影响，Loki 里还能不能查到新日志。"
     ;;
 
   *)

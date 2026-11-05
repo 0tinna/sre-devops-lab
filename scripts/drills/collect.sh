@@ -164,6 +164,86 @@ say "rs.txt"
 } > "$OUT/metrics.txt" 2>&1
 say "metrics.txt"
 
+# ── 7. 日志证据（Loki，尽力而为）─────────────────────────
+{
+  if kubectl -n monitoring get svc loki >/dev/null 2>&1; then
+    kubectl -n monitoring port-forward svc/loki 13100:3100 >/tmp/pf-loki.log 2>&1 &
+    LOKI_PID=$!
+    LOKI_READY=0
+    for i in $(seq 1 20); do
+      if curl -sf -o /dev/null http://127.0.0.1:13100/ready 2>/dev/null; then LOKI_READY=1; break; fi
+      sleep 1
+    done
+
+    if [ "$LOKI_READY" -eq 0 ]; then
+      echo "(Loki port-forward 未就绪，跳过日志采集)"
+      kill $LOKI_PID 2>/dev/null || true
+    else
+      echo "=== 采集时间 ==="
+      date '+%Y-%m-%d %H:%M:%S'
+      echo
+      echo "=== 各命名空间的日志量（近 15 分钟）==="
+      curl -s --get --data-urlencode 'query=sum by (namespace) (count_over_time({namespace=~".+"}[15m]))' \
+        http://127.0.0.1:13100/loki/api/v1/query 2>/dev/null | python3 "$PROM_PARSER" 2>/dev/null \
+        || echo "  (查询失败)"
+      echo
+      echo "=== sre-lab 各 Pod 的日志量（近 15 分钟）==="
+      curl -s --get --data-urlencode 'query=sum by (pod) (count_over_time({namespace="sre-lab"}[15m]))' \
+        http://127.0.0.1:13100/loki/api/v1/query 2>/dev/null | python3 "$PROM_PARSER" 2>/dev/null \
+        || echo "  (查询失败)"
+      echo
+      echo "=== sre-lab 中的 ERROR/FATAL 日志行数（近 15 分钟）==="
+      curl -s --get --data-urlencode 'query=sum by (pod) (count_over_time({namespace="sre-lab"} |~ "(?i)error|fatal|exception|panic" [15m]))' \
+        http://127.0.0.1:13100/loki/api/v1/query 2>/dev/null | python3 "$PROM_PARSER" 2>/dev/null \
+        || echo "  (查询失败)"
+      echo
+      echo "=== sre-lab 最近 40 行原始日志 ==="
+      START_NS=$(( $(date +%s) - 900 ))000000000
+      curl -s --get --data-urlencode 'query={namespace="sre-lab"}' \
+        --data-urlencode "start=$START_NS" --data-urlencode "limit=40" --data-urlencode "direction=backward" \
+        http://127.0.0.1:13100/loki/api/v1/query_range -o /tmp/loki-recent.json 2>/dev/null
+      python3 - /tmp/loki-recent.json <<'PY' 2>/dev/null || echo "  (查询失败)"
+import sys, json
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)["data"]["result"]
+except Exception:
+    print("  (无数据)"); raise SystemExit
+if not d:
+    print("  (Loki 中没有任何流 —— 采集链路可能已中断)"); raise SystemExit
+for s in d:
+    labels = s["stream"]
+    print("--- pod=%s container=%s ---" % (labels.get("pod", "?"), labels.get("container", "?")))
+    for ts, line in s["values"][:5]:
+        print("   ", line[:160])
+PY
+      echo
+      echo "=== ERROR 日志样本（最近 15 分钟，最多 20 行）==="
+      curl -s --get --data-urlencode 'query={namespace="sre-lab"} |~ "(?i)error|fatal|exception|panic"' \
+        --data-urlencode "start=$START_NS" --data-urlencode "limit=20" --data-urlencode "direction=backward" \
+        http://127.0.0.1:13100/loki/api/v1/query_range -o /tmp/loki-err.json 2>/dev/null
+      python3 - /tmp/loki-err.json <<'PY' 2>/dev/null || echo "  (查询失败)"
+import sys, json
+try:
+    with open(sys.argv[1]) as fh:
+        d = json.load(fh)["data"]["result"]
+except Exception:
+    print("  (无数据)"); raise SystemExit
+if not d:
+    print("  (没有匹配 error 的日志)")
+for s in d:
+    print("--- pod=%s ---" % s["stream"].get("pod", "?"))
+    for ts, line in s["values"][:5]:
+        print("   ", line[:200])
+PY
+      kill $LOKI_PID 2>/dev/null || true
+    fi
+  else
+    echo "(Loki 不可用，跳过日志采集)"
+  fi
+} > "$OUT/logs-loki.txt" 2>&1
+say "logs-loki.txt"
+
 rm -f "$OUT/_progress.txt"
 
 echo
@@ -177,7 +257,8 @@ echo "  1. summary.txt        先看整体：是调度、启动、还是运行�
 echo "  2. describe.txt       找 Events，这是最权威的证据"
 echo "  3. logs-previous.txt  如果容器重启过，崩溃原因在这里"
 echo "  4. endpoints.txt      Service 找不到后端时看这里"
-echo "  5. deploy.json / rs.txt  配置是否被意外改动"
-echo "  6. metrics.txt        用指标交叉验证你的假设"
+echo "  5. logs-loki.txt      应用日志：有没有 error、日志量是否异常、采集是否断了"
+echo "  6. deploy.json / rs.txt  配置是否被意外改动"
+echo "  7. metrics.txt        用指标交叉验证你的假设"
 echo
 echo "排查完执行：./scripts/drills/recover.sh"

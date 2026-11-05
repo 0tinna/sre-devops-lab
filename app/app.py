@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 import time
@@ -12,6 +13,15 @@ from prometheus_client import (
     generate_latest,
     multiprocess,
 )
+
+
+# 日志必须打到 stdout，容器运行时才能被 Fluent Bit 从 /var/log/containers 采到。
+logging.basicConfig(
+    level=os.getenv('LOG_LEVEL', 'INFO').upper(),
+    format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    stream=__import__('sys').stdout,
+)
+logger = logging.getLogger('demo-api')
 
 
 app = Flask(__name__)
@@ -114,6 +124,32 @@ def simulate_memory():
     chunks = [block for _ in range(max(mib, 0))]
     time.sleep(max(hold, 0))
     return jsonify(allocated_mib=len(chunks), held_seconds=max(hold, 0))
+
+
+@app.get('/simulate/degraded')
+def simulate_degraded():
+    """受控"静默降级"：依赖失败被捕获，仍返回 HTTP 200，但日志里有 ERROR。
+
+    这是最容易被监控漏掉的一类故障：
+      - HTTP 状态码 200，指标全绿
+      - 告警不会触发
+      - 只有日志能看出"其实是降级返回的"
+    """
+    if not FAULT_ENDPOINTS_ENABLED:
+        return _fault_disabled()
+    upstream = request.args.get('upstream', 'inventory-service')
+    latency = random.uniform(2.0, 3.5)
+    try:
+        # 模拟下游依赖超时
+        raise TimeoutError(f'{upstream} did not respond within {latency:.1f}s')
+    except TimeoutError as exc:
+        logger.error('downstream call failed, serving stale cache: %s', exc)
+    return jsonify(
+        status='degraded',
+        source='stale-cache',
+        upstream=upstream,
+        note='response served from cache because upstream is unavailable',
+    )
 
 
 @app.get('/metrics')
