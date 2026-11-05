@@ -1,0 +1,97 @@
+name: cd-selfhosted
+
+# 备选 CD 方案：runner 直接跑在 master 上。
+#
+# 本环境实测不可用：master 下载 actions-runner 包仅约 21 KB/s，
+# 100 MB 需要约 80 分钟。网络改善后可直接启用本 workflow。
+#
+# 启用步骤：
+#   1. 在 GitHub 仓库 Settings → Actions → Runners → New self-hosted runner 取 registration token
+#   2. 在 master 执行：sudo ./scripts/install-runner.sh --token <TOKEN>
+#   3. 确认 runner 出现在 Runners 列表且为 Idle
+#   4. 本 workflow 会在 ci 成功后自动部署
+#
+# 与 cd.yml 的区别：不需要把 SSH 私钥放到 GitHub Secrets，
+# 但 runner 以 root 运行且持有集群权限，只在实验环境可接受。
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: '要部署的 commit SHA（留空则用 origin/main）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: cd-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: [self-hosted, linux, sre-lab]
+    timeout-minutes: 20
+
+    steps:
+      - name: 解析目标版本
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.sha }}" ]; then
+            SHA="${{ inputs.sha }}"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            SHA="$(git -C /opt/sre-devops-lab rev-parse origin/main)"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "目标 SHA: $SHA"
+
+      - name: 同步代码
+        run: |
+          cd /opt/sre-devops-lab
+          git fetch --prune origin
+          git reset --hard "${{ steps.ver.outputs.sha }}"
+          git log --oneline -1
+
+      - name: 部署前校验
+        run: |
+          cd /opt/sre-devops-lab
+          python3 -m py_compile app/app.py app/gunicorn.conf.py scripts/opsctl.py
+          sed "s|image: ghcr.io/0tinna/sre-devops-lab:latest|image: ghcr.io/0tinna/sre-devops-lab:${{ steps.ver.outputs.sha }}|" \
+            k8s/app.yaml > /tmp/app-render.yaml
+          kubectl apply --dry-run=client -f /tmp/app-render.yaml
+
+      - name: apply 并等待就绪
+        run: |
+          cd /opt/sre-devops-lab
+          kubectl apply -f /tmp/app-render.yaml
+          kubectl -n sre-lab rollout status deploy/demo-api --timeout=300s
+
+      - name: 部署后验证
+        run: |
+          cd /opt/sre-devops-lab
+          kubectl -n sre-lab get pods -o wide
+          kubectl -n sre-lab get deploy demo-api \
+            -o jsonpath='image={.spec.template.spec.containers[0].image}{"\n"}'
+          kubectl -n sre-lab get deploy demo-api \
+            -o jsonpath='env={.spec.template.spec.containers[0].env[*].name}{"\n"}'
+          python3 scripts/opsctl.py health
+
+      - name: 失败时回滚
+        if: failure()
+        run: |
+          kubectl -n sre-lab rollout undo deploy/demo-api || true
+          kubectl -n sre-lab rollout status deploy/demo-api --timeout=180s || true
+          kubectl -n sre-lab get pods
+          exit 1

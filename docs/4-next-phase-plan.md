@@ -126,17 +126,83 @@ P2-5 需要给 `app/app.py` 加一个受控内存分配端点（默认关闭，�
 
 额外完成：`TargetDown`、`PodRestartTooOften` 在 CrashLoop 演练中真实触发并自动消解。
 
-### P2 故障演练 —— 部分完成
+### P2 故障演练 —— 已完成
 
-| # | 故障 | 状态 | 说明 |
+全部 7 项在 2026-11-05 15:23–15:45 执行完毕，每项都有实测证据。
+
+| # | 故障 | 结果 | 关键证据 |
 | --- | --- | --- | --- |
-| P2-1 | 自愈 | 未单独执行 | 发布滚动中已间接验证 |
-| P2-2 | ImagePullBackOff | 待执行 | 需占位 tag |
-| P2-3 | CrashLoopBackOff | ✅ 已执行 | `command: /bin/false` → 4 次重启 → 双告警 firing → `rollout undo` 恢复 |
-| P2-4 | Pending | 待执行 | |
-| P2-5 | OOMKilled | **可执行** | `/simulate/memory` 已随新镜像上线，验证返回 200 |
-| P2-6 | 慢请求 P95 | 待执行 | |
-| P2-7 | 回滚演练 | ✅ 部分 | `rollout undo` 已验证，`opsctl rollback` 待补 |
+| P2-1 | Pod 自愈 | ✅ PASS | 删除 Pod 后约 15 秒重建；`up` 始终为 7，抓取无缺口 |
+| P2-2 | ImagePullBackOff | ✅ PASS | 新 Pod `ImagePullBackOff`，Events 显示 `not found`；**老 Pod 2/2 继续服务，`/healthz` 返回 200** |
+| P2-3 | CrashLoopBackOff | ✅ PASS | `command: /bin/false` → 4 次重启 → `TargetDown` + `PodRestartTooOften` firing |
+| P2-4 | Pending（资源不足） | ✅ PASS | `requests.cpu=8` → Events：`1 Insufficient cpu, 1 node(s) had untolerated taint` |
+| P2-5 | OOMKilled | ✅ PASS（超预期） | limit 压到 64Mi 后 **两个 Pod 都 OOMKilled**，一次触发 5 类告警 |
+| P2-6 | P95 延迟 | ✅ PASS | 注入慢请求后 P95 稳定 2.2–2.35s，`DemoApiHighLatencyP95` 3 分钟后 firing |
+| P2-7 | 回滚演练 | ✅ PASS（发现陷阱） | `opsctl deploy` 坏镜像返回 1；`opsctl rollback` 恢复正常 |
+
+**P2-5 的意外收获**：64Mi 连 gunicorn 启动都不够，两个 Pod 直接 CrashLoopBackOff。
+这不是"我设计的演练"，而是更真实的故障——照抄配置压得太狠会连启动都过不去。
+一次同时触发 `ContainerOOMKilled`×2、`PodRestartTooOften`×2、`TargetDown`×2、
+`DeploymentReplicasMismatch`，共 7 条告警，是最好的告警演示现场。
+
+**P2-7 暴露的陷阱**：连续两次坏发布后 `rollout undo` 只回退一步，
+回退到的仍是坏版本（image 还是 `another-bad-tag`）。**undo ≠ 回到好版本**。
+正确做法是 `apply` 一份已知good的渲染清单。已写入 SOP 第 9 课。
+
+### 演练期间的告警覆盖情况
+
+| 告警 | 是否被真实触发 | 触发场景 |
+| --- | --- | --- |
+| `TargetDown` | ✅ | CrashLoop、OOMKilled |
+| `PodRestartTooOften` | ✅ | CrashLoop、OOMKilled |
+| `ContainerOOMKilled` | ✅ | OOMKilled（limit 64Mi） |
+| `DeploymentReplicasMismatch` | ✅ | OOMKilled 期间副本不可用 |
+| `DemoApiHighErrorRate` | ✅ | 注入 500 |
+| `DemoApiHighLatencyP95` | ✅ | 注入 /simulate/slow |
+| `PodNotReady` | ⬜ | 未单独构造（Pending 场景会命中，但未等到 firing） |
+| `NodeMemoryPressure` / `NodeDiskPressure` / `NodeHighCPU` | ⬜ | 未构造（不想压垮节点） |
+
+**10 条规则中 6 条经过真实触发验证**，剩余 4 条是容量类，构造成本高且风险大，
+在文档里如实标注为"未验证"，不假装验证过。
+
+### P3 交付与自动化 —— 大部分完成
+
+| 项目 | 状态 | 说明 |
+| --- | --- | --- |
+| `scripts/teardown.sh` | ✅ 完成 | `--dry-run` / `--keep-monitoring` / `--include-rbac`，语法校验通过 |
+| `opsctl health` 误报修复 | ✅ 完成 | 跳过 `deletionTimestamp` 非空的 Pod，滚动期间不再误报 |
+| CD workflow（SSH 版） | ✅ 完成，待配 Secrets | `.github/workflows/cd.yml`，链路已验证 |
+| CD workflow（self-hosted 版） | ⚠️ 保留备用 | runner 包下载仅 21 KB/s，100MB 需 80 分钟，本环境不可行 |
+| 部署密钥与链路 | ✅ 已验证 | 专用 ed25519 密钥，跳板机 → master 二级跳转实测通过 |
+
+**CD 的两种方案取舍**（面试可讲）：
+
+| 方案 | 优点 | 缺点 | 本项目选择 |
+| --- | --- | --- | --- |
+| self-hosted runner | 私钥不出 GitHub，runner 在集群内 | 需下载 100MB runner（本环境 80 分钟） | 保留备用 |
+| SSH 经跳板机 | 无需下载，立即可用 | 部署私钥要存进 GitHub Secrets | **采用** |
+
+启用 SSH 版 CD 需要配置 5 个 GitHub Secrets：
+
+```text
+JUMP_HOST      1.95.123.118
+JUMP_USER      root
+JUMP_SSH_KEY   <专用部署私钥内容>
+TARGET_HOST    172.31.6.211
+TARGET_USER    root
+```
+
+专用密钥已生成并验证（`root@1.95.123.118:~/.ssh/authorized_keys` 已装公钥），
+私钥文件在 `master:/root/.ssh/deploy_gh_actions`。
+
+### 本轮新增发现（已补进 SOP）
+
+| 发现 | 归入 |
+| --- | --- |
+| `rollout undo` 只回退一步，连续坏发布会回到坏版本 | SOP 第 9 课 |
+| `opsctl health` 把 Terminating Pod 报成故障 | 已修复 |
+| 管道会吞掉前一条命令的退出码（`cmd \| tail` 后 `$?` 是 tail 的） | SOP 第 9 课 |
+| `requests.cpu` 不能大于 `limits.cpu`，K8s 会在 API 层拒绝 | SOP 第 4 课 |
 
 ### 新增发现（原计划的盲区）
 
@@ -149,8 +215,15 @@ P2-5 需要给 `app/app.py` 加一个受控内存分配端点（默认关闭，�
 | `opsctl deploy` 超时 120s 偏紧 | 冷启动拉取会误报失败 | 演练时显式传 `--timeout 300s` |
 | registry.k8s.io 重定向域名解析失败 | kube-state-metrics 拉不下来 | 改用 `k8s.m.daocloud.io` |
 
-### P3 交付与自动化 —— 未开始
+## 8. 剩余待办
 
-- self-hosted runner：未开始。
-- `opsctl monitoring`：**已完成**（超出原计划，提前交付）。
-- `scripts/teardown.sh`：未开始。
+P1、P2 已全部完成，P3 主体完成。剩下的都是**需要外部条件或在真实环境才有意义**的项：
+
+| 项目 | 阻塞原因 | 怎么推进 |
+| --- | --- | --- |
+| 配 5 个 GitHub Secrets 启用 CD | 需要在 GitHub 网页操作 | 见 §7 P3 的 Secrets 清单 |
+| `PodNotReady` 告警验证 | 未单独构造场景 | 用 Pending 场景延长观察时间即可 |
+| 容量类告警验证（内存/磁盘/CPU） | 构造会压垮 3.6 GiB 的 worker | 在可丢弃环境做，或用 node-exporter 的 `--collector` 限流模拟 |
+| 日志集中收集（Loki/ELK） | 未在计划内，属于下一阶段 | 超出本项目范围 |
+| 链路追踪 | 同上 | 超出本项目范围 |
+| 告警分级响应流程 | 单机实验环境无值班概念 | 面试时如实说明这是差距 |

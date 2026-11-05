@@ -1070,7 +1070,85 @@ kubectl -n sre-lab get deploy demo-api -o jsonpath='{.spec.template.spec.contain
 它只保证"Pod 起来了"，不保证"Pod 用的是你以为的那份配置"。
 **每次发布后都要抽查关键字段**，这是第 9 课的核心习惯。
 
-### 9.3 现象：dry-run 报 namespace 不存在
+### 9.3 更隐蔽的坑：`rollout undo` 不等于回到好版本
+
+**本项目实测踩到**：连续两次推送坏镜像后执行 `opsctl rollback`，结果**仍然是坏的**。
+
+```text
+1) opsctl deploy <bad-tag-1>   → revision 17，ErrImagePull
+2) opsctl deploy <bad-tag-2>   → revision 18，ErrImagePull
+3) opsctl rollback             → 退出码 1，image 仍是 <bad-tag-1>！
+```
+
+**原因**：`rollout undo` 只**回退一步**（到上一个 revision）。
+如果上一个 revision 本身就是坏的，回退等于没回退。
+
+**更糟的是**：undo 回退的是**整个 Pod template**，不只是镜像。
+本项目历史 ReplicaSet 里只有当前那个带完整 5 个 env，更早的都只有 `PORT`——
+一旦 undo 落到它们身上，`PROMETHEUS_MULTIPROC_DIR` 会一起丢掉，指标问题复发。
+
+**正确做法**：回滚前先确认目标 revision 是好版本，否则直接 `apply` 已知good的清单。
+
+```bash
+# ① 先看每个 revision 的实际配置，不要只看编号
+for rs in $(kubectl -n sre-lab get rs -o name); do
+  echo "$rs"
+  kubectl -n sre-lab get $rs -o jsonpath='  image={.spec.template.spec.containers[0].image}{"\n"}'
+  kubectl -n sre-lab get $rs -o jsonpath='  env={.spec.template.spec.containers[0].env[*].name}{"\n"}'
+done
+
+# ② 目标明确才 undo，且 undo 后立刻验证
+kubectl -n sre-lab rollout undo deploy/demo-api
+kubectl -n sre-lab get deploy demo-api -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n sre-lab get deploy demo-api -o jsonpath='{.spec.template.spec.containers[0].env[*].name}{"\n"}'
+
+# ③ 不确定时：直接 apply 一份已知good的清单，这是唯一可靠的回滚
+sed "s|:latest|:<known-good-sha>|" k8s/app.yaml > /tmp/app-render.yaml
+kubectl apply -f /tmp/app-render.yaml
+```
+
+**判断规则**：
+
+| 场景 | 用什么 |
+| --- | --- |
+| 只回退一步，且上一版确认是好的 | `rollout undo` |
+| 连续多次坏发布 | **`apply` 已知good清单** |
+| 配置也变了（env/volume/probe） | **`apply`**，undo 会连带丢配置 |
+| 不确定 | **`apply`** |
+
+**教训**：`rollout undo` 是"撤销上一步操作"的指令，不是"回到健康状态"的指令。
+这两件事在故障场景下经常不等价。
+
+### 9.4 另一个静默失败：管道会吞掉退出码
+
+**本项目实测**：
+
+```bash
+python3 scripts/opsctl.py deploy <bad-image> 2>&1 | tail -3
+echo $?      # 输出 0 ！
+```
+
+`opsctl deploy` 内部正确返回了 `1`，但管道让 `$?` 变成了 `tail` 的退出码 `0`。
+**发布失败被脚本判定成功了**——在 CI 里这就是"流水线绿灯但部署是坏的"。
+
+**正确写法**：
+
+```bash
+# ① 不走管道，先存日志再判断
+python3 scripts/opsctl.py deploy <image> >/tmp/deploy.log 2>&1
+rc=$?
+tail -3 /tmp/deploy.log
+[ $rc -eq 0 ] || { echo "部署失败"; exit 1; }
+
+# ② 既要看输出又要退出码，用 PIPESTATUS
+python3 scripts/opsctl.py deploy <image> 2>&1 | tee /tmp/deploy.log
+rc=${PIPESTATUS[0]}
+```
+
+**适用场景**：任何「命令 | 过滤」后判断成败的地方——CI 脚本、巡检脚本、
+`kubectl ... | grep` 后判断是否有输出。
+
+### 9.5 现象：dry-run 报 namespace 不存在
 
 校验多文档清单时大量报错：
 
@@ -1079,12 +1157,12 @@ Error from server (NotFound): error when creating "00-namespace-rbac.yaml":
 namespaces "monitoring" not found
 ```
 
-### 9.4 根因
+### 9.6 根因
 
 `--dry-run=server` 会真的走到 API server 做校验，但**不会真的创建 namespace**，
 所以后续对象引用的 namespace 不存在。**这是预期行为，不是清单写错。**
 
-### 9.5 处置：固定三步流程
+### 9.7 处置：固定三步流程
 
 ```bash
 # ① 静态校验：不需要依赖对象存在
@@ -1100,7 +1178,7 @@ kubectl -n monitoring get pods -w
 **本项目实际做法**：先用 client 校验全部 21 个对象通过，再真正 apply。
 server dry-run 只在 namespace 已存在时才有意义。
 
-### 9.6 验证清单
+### 9.8 验证清单
 
 发布前必查：
 
@@ -1136,7 +1214,7 @@ for p in ['/healthz','/readyz','/simulate/error']:
 "
 ```
 
-### 9.7 预防
+### 9.9 预防
 
 把校验写进 CI，而不是靠人记得。本项目 `ci.yml` 已经包含
 compile check + unit test，`--dry-run` 因为需要集群凭证所以留给本地/部署机执行。
@@ -1147,7 +1225,9 @@ compile check + unit test，`--dry-run` 因为需要集群凭证所以留给本�
 2. 为什么 CI 里不做 `--dry-run=server`？
 3. 发布后 `rollout status` 成功，能说明配置生效了吗？
 4. 用 `set image` 发布一个"同时改了 env"的版本，会发生什么？
-5. 校验清单时 client 和 server 应该都跑吗？
+5. 连续两次坏发布后 `rollout undo`，为什么可能还是坏的？
+6. `cmd 2>&1 | tail -3; echo $?` 输出 0，说明命令成功了吗？
+7. 校验清单时 client 和 server 应该都跑吗？
 
 <details>
 <summary>参考答案</summary>
@@ -1156,7 +1236,9 @@ compile check + unit test，`--dry-run` 因为需要集群凭证所以留给本�
 2. 因为 server dry-run 需要连接真实集群和凭证。公网 CI runner 不应该持有集群 kubeconfig（本项目明确不采用这个方案）。
 3. 不能。`rollout status` 只保证"Pod 起来且就绪"，不保证"Pod 用的是你以为的那份配置"。本项目实际踩过：镜像更新成功，但新增的 env 和 emptyDir 全部没生效，Pod 照样 Running。
 4. 只有镜像字段被更新，env / volume / probe 等改动全部丢失，且不会有任何报错。表现为"新代码在跑，但新配置没生效"，极难排查。
-5. 建议都跑：client 快速抓语法错误，server 在依赖存在时做语义校验。顺序是先 client 后 server。
+5. 因为 `undo` 只回退一步到上一个 revision，而上一个本身就是坏的。而且它回退整个 Pod template，配置也可能一起退回旧版。此时唯一可靠的做法是 `apply` 一份已知good的清单。
+6. 不能。`$?` 拿到的是管道末端 `tail` 的退出码。要用 `cmd >log 2>&1; rc=$?` 或 `${PIPESTATUS[0]}`。本项目因此差点把一次失败发布判成成功。
+7. 建议都跑：client 快速抓语法错误，server 在依赖存在时做语义校验。顺序是先 client 后 server。
 
 </details>
 
@@ -1210,7 +1292,9 @@ kubectl -n <ns> rollout history deploy/<name>
 | 7 | 错误率偏低、阈值达不到 | 探针高频 200 稀释分母 |
 | 8 | 告警长时间不消解 | 长窗口样本未滑出，正常 |
 | 9a | 改了 env/volume 但没生效、`set image` 后行为异常 | `set image` 只改镜像字段 |
-| 9b | dry-run 报 namespace 不存在 | server dry-run 不创建依赖对象 |
+| 9b | 回滚后还是坏的 | `undo` 只回退一步，且回退整个 template |
+| 9c | 脚本判定发布成功但实际失败 | 管道吞掉了前一条命令的退出码 |
+| 9d | dry-run 报 namespace 不存在 | server dry-run 不创建依赖对象 |
 
 ## 附录 C · 复盘方法论
 

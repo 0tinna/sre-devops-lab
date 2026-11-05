@@ -55,6 +55,11 @@ def health(args):
     for pod in pods.get('items', []):
         name = pod['metadata']['name']
         namespace = pod['metadata']['namespace']
+        # 正在删除的 Pod 不计入判定：滚动更新、回滚、缩容期间它们必然处于
+        # Terminating 且 phase 可能是 Pending/Unknown，报出来只是噪音。
+        # 判定依据是 deletionTimestamp，而不是 phase。
+        if pod['metadata'].get('deletionTimestamp'):
+            continue
         phase = pod['status'].get('phase')
         if phase not in ('Running', 'Succeeded'):
             issues.append(f'pod {namespace}/{name} is {phase}')
@@ -70,7 +75,6 @@ def health(args):
         available = dep['status'].get('availableReplicas', 0)
         if available < desired:
             issues.append(f'deployment {namespace}/{name} has {available}/{desired} replicas')
-
     if issues:
         print('NOT OK')
         for issue in issues:

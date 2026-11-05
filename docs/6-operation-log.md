@@ -366,3 +366,103 @@ demo-api   2/2 Running   镜像 cce5412d...   3 个故障端点可用
 monitoring 6/6 Ready     7/7 target up      10 条规则 health=ok
 告警       0 条          全部已消解
 ```
+
+## 14. 2026-11-05 15:23–15:50 P2 故障演练全量执行
+
+执行者：Little Code Sauce（经跳板机到 master）
+
+### 14.1 七项演练结果
+
+| # | 演练 | 注入方式 | 结果 | 恢复方式 |
+| --- | --- | --- | --- | --- |
+| D1 | Pod 自愈 | `delete pod` | 约 15 秒重建；`up` 始终 7 | 自动 |
+| D2 | ImagePullBackOff | `set image :missing-tag` | 新 Pod 拉取失败，老 Pod 2/2 继续服务，`/healthz` 200 | `rollout undo` |
+| D3 | CrashLoopBackOff | `command: /bin/false` | 4 次重启，双告警 firing | `rollout undo` |
+| D4 | Pending | `requests.cpu=8` + `limits.cpu=8` | Events：`1 Insufficient cpu, 1 untolerated taint` | `rollout undo` |
+| D5 | OOMKilled | limit 压到 64Mi + `/simulate/memory?mib=300` | **两个 Pod 都 OOMKilled，exit=137** | 恢复 256Mi |
+| D6 | P95 延迟 | 持续 `/simulate/slow` 3 并发 | P95 稳定 2.2–2.35s，`DemoApiHighLatencyP95` firing | 停止注入 |
+| D7 | 回滚 | `opsctl deploy` 坏镜像 → `rollback` | deploy 返回 1；**rollback 回到仍是坏版本的 revision** | `apply` 恢复 |
+
+### 14.2 D4 第一次尝试被 API 拒绝
+
+```text
+The Deployment "demo-api" is invalid: spec.template.spec.containers[0].resources.requests:
+Invalid value: "8": must be less than or equal to cpu limit of 500m
+```
+
+`requests` 不能大于 `limits`，Kubernetes 在 API 层直接拒绝。改为两者同时调到 8 才通过。
+**这个约束在构造 Pending 场景时容易忽略。**
+
+### 14.3 D5 的超预期结果
+
+压低到 64Mi 后，两个 Pod **都无法启动**（gunicorn + Python 本身就要超过 64Mi），
+直接进入 CrashLoopBackOff。这不是"运行中内存泄漏被 OOMKill"，而是"limit 太小连启动都过不去"。
+
+反而成了最好的告警演示：一次同时触发 7 条告警。
+
+```text
+PodRestartTooOften      firing  warning   ×2
+ContainerOOMKilled      firing  critical  ×2
+TargetDown              pending critical  ×2
+DeploymentReplicasMismatch firing critical ×1
+```
+
+证据：`lastState.terminated.reason=OOMKilled`，`exitCode=137`，`restartCount=3`。
+
+### 14.4 D7 暴露的严重陷阱
+
+```text
+1) opsctl deploy <bad-tag-1>  → revision 17
+2) opsctl deploy <bad-tag-2>  → revision 18
+3) opsctl rollback            → 退出码 1，image 仍是 <bad-tag-1>
+```
+
+`rollout undo` 只回退一步。连续坏发布时，回退目标本身就是坏的。
+且它回退整个 Pod template——本项目历史 ReplicaSet 里只有当前那个带完整 5 个 env，
+落到旧 RS 上会连 `PROMETHEUS_MULTIPROC_DIR` 一起丢掉。
+
+**最终用 `apply` 渲染清单恢复**，这再次印证第 9 课的结论。
+
+### 14.5 顺带修掉的缺陷：opsctl health 误报
+
+演练中发现 `opsctl health` 把正在 Terminating 的旧 Pod 报成 `Pending` 故障，
+导致发布/回滚期间健康检查一定返回非零。
+
+修复：跳过 `metadata.deletionTimestamp` 非空的 Pod。
+
+```python
+# 判定依据是 deletionTimestamp，而不是 phase
+if pod['metadata'].get('deletionTimestamp'):
+    continue
+```
+
+验证：滚动更新进行中（同时存在 Terminating 和 ContainerCreating）执行 `health`，
+返回 `OK` 且退出码 0；修复前必然 `NOT OK`。
+
+### 14.6 管道吞退出码的实测
+
+```bash
+python3 scripts/opsctl.py deploy <bad> 2>&1 | tail -3
+echo $?     # 0  ← 错！实际部署失败
+```
+
+改为 `cmd >log 2>&1; rc=$?` 后正确得到 `1`。已写入 SOP 第 9 课。
+
+### 14.7 演练期间的告警覆盖
+
+10 条规则中 **6 条经过真实触发**：`TargetDown`、`PodRestartTooOften`、
+`ContainerOOMKilled`、`DeploymentReplicasMismatch`、`DemoApiHighErrorRate`、
+`DemoApiHighLatencyP95`。
+
+未触发的 4 条如实标注：`PodNotReady`（未单独构造）、
+`NodeMemoryPressure` / `NodeDiskPressure` / `NodeHighCPU`（构造会压垮 3.6 GiB 的 worker）。
+
+### 14.8 最终状态
+
+```text
+master/node          Ready
+demo-api             2/2 Running，镜像 cce5412d，5 个 env 完整
+monitoring           6/6 Ready
+告警                 0 条，全部消解
+opsctl health        OK
+```

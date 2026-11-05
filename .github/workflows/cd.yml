@@ -1,0 +1,154 @@
+name: cd
+
+# 自动部署到内网集群。
+#
+# 链路：GitHub 托管 runner → SSH 跳板机（公网 1.95.123.118）→ SSH master（内网 172.31.6.211）
+#
+# 为什么不用 self-hosted runner：
+#   实测 master 下载 actions-runner 包只有 21 KB/s（100 MB 需约 80 分钟），
+#   在此网络环境下不可行。详见 docs/4-next-phase-plan.md 的 P3 章节。
+#
+# 为什么用 apply 而不是 set image：
+#   set image 只改镜像字段，env / volume / probe 改动会静默丢失（演练中踩过）。
+#
+# 需要的 GitHub Secrets：
+#   JUMP_HOST          跳板机地址，如 1.95.123.118
+#   JUMP_USER          跳板机用户名，如 root
+#   JUMP_SSH_KEY       跳板机私钥（专用部署密钥，不要复用个人密钥）
+#   TARGET_HOST        master 内网地址，如 172.31.6.211
+#   TARGET_USER        master 用户名，如 root
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: '要部署的 commit SHA（留空则用 main 最新）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: cd-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 解析目标版本
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.sha }}" ]; then
+            SHA="${{ inputs.sha }}"
+          elif [ "${{ github.event_name }}" = "workflow_run" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            SHA="${{ github.sha }}"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "目标 SHA: $SHA"
+
+      - name: 等待镜像出现在 GHCR
+        env:
+          SHA: ${{ steps.ver.outputs.sha }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          IMG_PATH="${OWNER}/${REPO}"
+          for i in $(seq 1 30); do
+            TOKEN=$(curl -s --max-time 10 \
+              "https://ghcr.io/token?scope=repository:${IMG_PATH}:pull&service=ghcr.io" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))')
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${IMG_PATH}/manifests/${SHA}")
+            echo "t+$((i*10))s manifest=$CODE"
+            [ "$CODE" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "镜像未在 GHCR 就绪" >&2
+          exit 1
+
+      - name: 通过跳板机部署
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.JUMP_HOST }}
+          username: ${{ secrets.JUMP_USER }}
+          key: ${{ secrets.JUMP_SSH_KEY }}
+          command_timeout: 15m
+          script_stop: true
+          envs: SHA,TARGET_HOST,TARGET_USER
+          script: |
+            set -eu
+            # 从跳板机继续跳到 master（跳板机到 master 已配置免密）
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                "${TARGET_USER}@${TARGET_HOST}" \
+                "SHA='${SHA}' bash -s" <<'REMOTE'
+            set -eu
+            cd /opt/sre-devops-lab
+
+            echo "=== 1. 同步代码到目标版本 ==="
+            git fetch --prune origin
+            git reset --hard "$SHA"
+            git log --oneline -1
+
+            echo "=== 2. 部署前校验 ==="
+            python3 -m py_compile app/app.py app/gunicorn.conf.py scripts/opsctl.py
+            sed "s|image: ghcr.io/0tinna/sre-devops-lab:latest|image: ghcr.io/0tinna/sre-devops-lab:$SHA|" \
+              k8s/app.yaml > /tmp/app-render.yaml
+            kubectl apply --dry-run=client -f /tmp/app-render.yaml
+
+            echo "=== 3. 预热镜像 ==="
+            TIMEOUT=300; ELAPSED=0
+            until crictl pull "ghcr.io/0tinna/sre-devops-lab:$SHA" >/tmp/pull.log 2>&1; do
+              ELAPSED=$((ELAPSED+15))
+              [ "$ELAPSED" -ge "$TIMEOUT" ] && { echo "镜像拉取超时"; tail -3 /tmp/pull.log; exit 1; }
+              sleep 15
+            done
+            echo "镜像已就绪"
+
+            echo "=== 4. apply 并等待就绪 ==="
+            kubectl apply -f /tmp/app-render.yaml
+            kubectl -n sre-lab rollout status deploy/demo-api --timeout=300s
+
+            echo "=== 5. 部署后验证 ==="
+            kubectl -n sre-lab get pods -o wide
+            kubectl -n sre-lab get deploy demo-api \
+              -o jsonpath='image={.spec.template.spec.containers[0].image}{"\n"}'
+            kubectl -n sre-lab get deploy demo-api \
+              -o jsonpath='env={.spec.template.spec.containers[0].env[*].name}{"\n"}'
+            python3 scripts/opsctl.py health
+            REMOTE
+
+      - name: 失败时回滚
+        if: failure()
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.JUMP_HOST }}
+          username: ${{ secrets.JUMP_USER }}
+          key: ${{ secrets.JUMP_SSH_KEY }}
+          command_timeout: 10m
+          envs: TARGET_HOST,TARGET_USER
+          script: |
+            set -eu
+            ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                "${TARGET_USER}@${TARGET_HOST}" \
+                'kubectl -n sre-lab rollout undo deploy/demo-api; \
+                 kubectl -n sre-lab rollout status deploy/demo-api --timeout=180s; \
+                 kubectl -n sre-lab get pods; \
+                 echo "注意：undo 只回退一步，连续多次坏发布需手动 apply 已知good清单"' \
+                || true
