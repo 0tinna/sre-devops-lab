@@ -1,0 +1,314 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: sre-lab
+        environment: lab
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager.monitoring.svc.cluster.local:9093
+
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ['localhost:9090']
+
+      - job_name: alertmanager
+        static_configs:
+          - targets: ['alertmanager.monitoring.svc.cluster.local:9093']
+
+      # 业务应用：靠 Pod 注解 prometheus.io/scrape 自动发现
+      - job_name: demo-api
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ['sre-lab']
+        relabel_configs:
+          - source_labels: ['__meta_kubernetes_pod_annotation_prometheus_io_scrape']
+            action: keep
+            regex: 'true'
+          - source_labels: ['__meta_kubernetes_pod_annotation_prometheus_io_path']
+            action: replace
+            target_label: '__metrics_path__'
+            regex: '(.+)'
+          - source_labels: ['__address__', '__meta_kubernetes_pod_annotation_prometheus_io_port']
+            action: replace
+            regex: '([^:]+)(?::\d+)?;(\d+)'
+            replacement: '$1:$2'
+            target_label: '__address__'
+          - source_labels: ['__meta_kubernetes_namespace']
+            target_label: namespace
+          - source_labels: ['__meta_kubernetes_pod_name']
+            target_label: pod
+          - source_labels: ['__meta_kubernetes_pod_label_app_kubernetes_io_name']
+            target_label: app
+
+      # 节点指标：node-exporter 以 hostNetwork + hostPort 9100 暴露
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: ['__address__']
+            action: replace
+            regex: '(.+):(\d+)'
+            replacement: '$1:9100'
+            target_label: '__address__'
+          - source_labels: ['__meta_kubernetes_node_name']
+            target_label: node
+
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: ['kube-state-metrics.monitoring.svc.cluster.local:8080']
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  sre-lab-alerts.yml: |
+    groups:
+      - name: availability
+        rules:
+          # 监控目标不可用：任何 job 有 target down 超过 1 分钟
+          - alert: TargetDown
+            expr: up == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: '监控目标不可用 {{ $labels.job }} / {{ $labels.instance }}'
+              description: 'Prometheus 连续 1 分钟无法抓取该目标，服务可能不可用。'
+
+          # 可用副本不足
+          - alert: DeploymentReplicasMismatch
+            expr: |
+              kube_deployment_status_replicas_available
+                < kube_deployment_spec_replicas
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: 'Deployment {{ $labels.namespace }}/{{ $labels.deployment }} 副本不足'
+              description: '期望 {{ $value }} 个可用副本，实际不可用：可用副本低于期望值持续 2 分钟。'
+
+          # Pod 处于非 Running 状态
+          - alert: PodNotReady
+            expr: |
+              kube_pod_status_phase{phase=~"Pending|Unknown|Failed"} == 1
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'Pod {{ $labels.namespace }}/{{ $labels.pod }} 状态异常'
+              description: 'Pod 已处于 {{ $labels.phase }} 超过 2 分钟。'
+
+      - name: reliability
+        rules:
+          # 5xx 比例过高
+          # 分母刻意排除探针与指标端点：healthz/readyz 的高频 200 会把业务错误率稀释掉，
+          # 例如探针 0.3 rps + 业务 1 rps 时，业务 100% 失败也只显示 77%。
+          - alert: DemoApiHighErrorRate
+            expr: |
+              (
+                sum(rate(demo_http_requests_total{status=~"5..",path!~"/healthz|/readyz|/metrics"}[2m]))
+                /
+                (sum(rate(demo_http_requests_total{path!~"/healthz|/readyz|/metrics"}[2m])) > 0)
+              ) > 0.05
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: 'demo-api 5xx 比例过高'
+              description: '最近 2 分钟业务请求中 5xx 占比超过 5%（已排除探针端点）。'
+
+          # P95 延迟过高
+          - alert: DemoApiHighLatencyP95
+            expr: |
+              histogram_quantile(
+                0.95,
+                sum by (le) (rate(demo_http_request_duration_seconds_bucket[5m]))
+              ) > 1
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'demo-api P95 延迟超过 1s'
+              description: '最近 5 分钟 P95 请求延迟为 {{ $value | humanizeDuration }}。'
+
+          # Pod 重启过于频繁
+          - alert: PodRestartTooOften
+            expr: |
+              increase(kube_pod_container_status_restarts_total[15m]) > 3
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'Pod {{ $labels.namespace }}/{{ $labels.pod }} 频繁重启'
+              description: '15 分钟内重启次数超过 3 次，检查容器退出原因与 OOM。'
+
+          # 容器 OOM 被杀
+          - alert: ContainerOOMKilled
+            expr: |
+              kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: '容器 {{ $labels.container }} 曾因 OOM 被杀'
+              description: '内存 limit 可能过小，或应用存在内存泄漏。'
+
+      - name: capacity
+        rules:
+          # 节点内存压力
+          - alert: NodeMemoryPressure
+            expr: |
+              (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.9
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: '节点 {{ $labels.node }} 内存使用率超过 90%'
+              description: '可用内存不足 10%，工作节点仅 3.6 GiB，注意调度。'
+
+          # 节点磁盘压力
+          - alert: NodeDiskPressure
+            expr: |
+              (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) > 0.85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: '节点 {{ $labels.node }} 磁盘 {{ $labels.mountpoint }} 使用率超过 85%'
+              description: '磁盘剩余空间不足，镜像与日志可能堆积。'
+
+          # 节点 CPU 饱和
+          - alert: NodeHighCPU
+            expr: |
+              (1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > 0.85
+            for: 10m
+            labels:
+              severity: info
+            annotations:
+              summary: '节点 {{ $labels.node }} CPU 使用率超过 85%'
+              description: '持续 10 分钟高于 85%，检查是否有异常负载。'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: sre-devops-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/part-of: sre-devops-lab
+    spec:
+      serviceAccountName: prometheus
+      nodeSelector:
+        kubernetes.io/hostname: master
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: docker.m.daocloud.io/prom/prometheus:v3.6.0
+          args:
+            - '--config.file=/etc/prometheus/prometheus.yml'
+            - '--storage.tsdb.path=/prometheus'
+            - '--storage.tsdb.retention.time=6h'
+            - '--storage.tsdb.retention.size=1GB'
+            - '--web.enable-lifecycle'
+            - '--web.listen-address=:9090'
+          ports:
+            - name: http
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: sre-devops-lab
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http

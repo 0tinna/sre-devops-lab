@@ -1,0 +1,259 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-provider
+  namespace: monitoring
+data:
+  provider.yml: |
+    apiVersion: 1
+    providers:
+      - name: sre-lab
+        orgId: 1
+        folder: 'SRE Lab'
+        type: file
+        disableDeletion: false
+        allowUiUpdates: true
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-sre-lab
+  namespace: monitoring
+data:
+  sre-lab-overview.json: |
+    {
+      "uid": "sre-lab-overview",
+      "title": "SRE Lab Overview",
+      "tags": ["sre-lab", "demo-api"],
+      "timezone": "browser",
+      "editable": true,
+      "schemaVersion": 39,
+      "refresh": "30s",
+      "time": { "from": "now-30m", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "namespace",
+            "type": "query",
+            "datasource": { "type": "prometheus", "uid": "prometheus" },
+            "query": "label_values(kube_pod_info, namespace)",
+            "current": { "text": "sre-lab", "value": "sre-lab" },
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "stat",
+          "title": "Targets UP",
+          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+          "targets": [
+            { "refId": "A", "expr": "sum(up == 1)", "legendFormat": "up" },
+            { "refId": "B", "expr": "count(up)", "legendFormat": "total" }
+          ]
+        },
+        {
+          "id": 2,
+          "type": "stat",
+          "title": "Request Rate (req/s)",
+          "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+          "targets": [
+            { "refId": "A", "expr": "sum(rate(demo_http_requests_total[2m]))", "legendFormat": "rps" }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "stat",
+          "title": "5xx Ratio",
+          "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "orange", "value": 0.01 },
+                { "color": "red", "value": 0.05 }
+              ]
+            }
+          },
+          "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "(sum(rate(demo_http_requests_total{status=~\"5..\"}[2m])) or vector(0)) / sum(rate(demo_http_requests_total[2m]))",
+              "legendFormat": "5xx"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "P95 Latency",
+          "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "orange", "value": 0.5 },
+                { "color": "red", "value": 1 }
+              ]
+            }
+          },
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(demo_http_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "p95"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "Firing Alerts",
+          "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "red", "value": 1 }
+              ]
+            }
+          },
+          "targets": [
+            { "refId": "A", "expr": "ALERTS{alertstate=\"firing\"}", "legendFormat": "{{alertname}}" }
+          ]
+        },
+        {
+          "id": 10,
+          "type": "timeseries",
+          "title": "Requests by Status",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10, "lineWidth": 2 } }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (status) (rate(demo_http_requests_total[2m]))",
+              "legendFormat": "{{status}}"
+            }
+          ]
+        },
+        {
+          "id": 11,
+          "type": "timeseries",
+          "title": "Latency P50 / P95 / P99",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "lineWidth": 2 } }, "overrides": [] },
+          "targets": [
+            { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(demo_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+            { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(demo_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+            { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(demo_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+          ]
+        },
+        {
+          "id": 20,
+          "type": "timeseries",
+          "title": "Pod Memory vs Limit",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+          "targets": [
+            { "refId": "A", "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=~\"$namespace\", container!=\"\"})", "legendFormat": "{{pod}}" },
+            { "refId": "B", "expr": "sum by (pod) (kube_pod_container_resource_limits{namespace=~\"$namespace\", resource=\"memory\"})", "legendFormat": "limit {{pod}}" }
+          ]
+        },
+        {
+          "id": 21,
+          "type": "timeseries",
+          "title": "Pod CPU vs Request",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "cores", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+          "targets": [
+            { "refId": "A", "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=~\"$namespace\", container!=\"\"}[2m]))", "legendFormat": "{{pod}}" },
+            { "refId": "B", "expr": "sum by (pod) (kube_pod_container_resource_requests{namespace=~\"$namespace\", resource=\"cpu\"})", "legendFormat": "request {{pod}}" }
+          ]
+        },
+        {
+          "id": 30,
+          "type": "timeseries",
+          "title": "Node Memory Usage",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "custom": { "fillOpacity": 10 } }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)",
+              "legendFormat": "{{node}}"
+            }
+          ]
+        },
+        {
+          "id": 31,
+          "type": "timeseries",
+          "title": "Node Filesystem Usage (/)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "custom": { "fillOpacity": 10 } }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "1 - (node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"})",
+              "legendFormat": "{{node}}"
+            }
+          ]
+        },
+        {
+          "id": 40,
+          "type": "timeseries",
+          "title": "Deployment Available Replicas",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10 } }, "overrides": [] },
+          "targets": [
+            { "refId": "A", "expr": "kube_deployment_status_replicas_available{namespace=~\"$namespace\"}", "legendFormat": "available {{deployment}}" },
+            { "refId": "B", "expr": "kube_deployment_spec_replicas{namespace=~\"$namespace\"}", "legendFormat": "desired {{deployment}}" }
+          ]
+        },
+        {
+          "id": 41,
+          "type": "timeseries",
+          "title": "Container Restarts",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10 } }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "increase(kube_pod_container_status_restarts_total{namespace=~\"$namespace\"}[15m])",
+              "legendFormat": "{{pod}}/{{container}}"
+            }
+          ]
+        }
+      ]
+    }
