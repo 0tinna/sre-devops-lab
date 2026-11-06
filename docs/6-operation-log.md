@@ -684,3 +684,125 @@ ERROR 日志样本
 ```
 
 这条已记入 `docs/drills/answers.md` 的 S10 预防章节，作为后续任务。
+
+## 17. 2026-11-06 09:15–09:45 P5 自动扩缩容与告警补全
+
+### 17.1 metrics-server
+
+| 项 | 值 |
+| --- | --- |
+| 版本 | v0.8.0（K8s 1.34 兼容） |
+| 镜像源 | `k8s.m.daocloud.io/metrics-server/metrics-server` |
+| 部署位置 | master（nodeSelector + toleration） |
+| 关键参数 | `--kubelet-insecure-tls`（自签证书必须） |
+| 资源 | req 50m/64Mi，lim 200m/128Mi |
+| APIService | `v1beta1.metrics.k8s.io` → AVAILABLE=True |
+
+验证：
+
+```text
+kubectl top nodes
+  master  110m  2%   2916Mi 18%
+  node     36m  1%   1869Mi 51%
+kubectl top pods -n sre-lab
+  demo-api-xxx  1m  69Mi
+```
+
+### 17.2 HPA 配置
+
+```yaml
+minReplicas: 2
+maxReplicas: 5
+target: CPU 70%（相对 request 100m，即 70m 触发）
+behavior:
+  scaleUp:   稳定窗口 0s，Percent 100/30s + Pods 2/30s，取 Max
+  scaleDown: 稳定窗口 300s，Pods 1/60s，取 Min
+```
+
+### 17.3 扩容实测（教科书级）
+
+压测方式：16 并发持续请求 `/simulate/cpu?ms=200`（服务端纯计算循环，不 sleep）。
+
+| 时刻 | 副本数 | HPA 读数 |
+| --- | --- | --- |
+| t+0s | 2 | `cpu: 2%/70%` |
+| t+30s | **4** | `cpu: 488%/70%` |
+| t+60s | **5**（触顶） | `cpu: 444%/70%` |
+| t+90s ~ t+240s | 5（稳定） | `cpu: 365%` 左右 |
+
+**30 秒内 2→4，60 秒内到上限**。`stabilizationWindowSeconds: 0` + `Percent 100` + `selectPolicy: Max`
+的效果非常直接。
+
+每个 Pod 被限流在约 `370m`（limit 500m），说明 CFS 限流生效，
+CPU 打不满 limit 但已经远超 request 的 70%。
+
+### 17.4 缩容实测
+
+停止压测时刻：`09:33:01`
+
+| 时刻 | 相对时间 | 副本数 | 说明 |
+| --- | --- | --- | --- |
+| 09:33:46 ~ 09:38:16 | t+45s ~ t+315s | 5 | **稳定窗口生效，不动** |
+| 09:39:01 | t+360s | 4 | 开始缩 |
+| 09:39:47 | t+405s | 3 | |
+| 09:40:32 | t+450s | 2 | 回到 minReplicas |
+
+**从停止压测到开始缩容等了约 5 分钟**，与 `stabilizationWindowSeconds: 300` 完全吻合。
+之后每约 50-60 秒减 1，符合 `Pods: 1, periodSeconds: 60`。
+
+这个"扩得快、缩得慢"的不对称设计是刻意的：
+扩容慢了会丢请求，缩容快了会在流量抖动时反复扩缩（flapping）。
+
+### 17.5 告警补全：10 → 16 条
+
+新增 6 条，覆盖前三层看不到的盲区：
+
+| 告警 | 覆盖什么盲区 |
+| --- | --- |
+| `LogCollectorDown` | 日志采集器掉线（场景 10 暴露的缺口） |
+| `LokiNotReceivingLogs` | 采集器在但写入链路断了 |
+| `HPAMaxedOut` | 扩不动了，容量规划需要调整 |
+| `HPAUnableToScale` | metrics-server / APIService 故障 |
+| `PodCPUNearLimit` | 接近 CFS 限流边界，延迟会尖刺 |
+| `PodMemoryNearLimit` | 接近 OOMKilled 阈值，提前介入 |
+
+### 17.6 一个没触发但很有价值的观察
+
+压测期间这 6 条新告警**一条都没触发**：
+
+```text
+NodeHighCPU          触发采样数 = 0    （node 只到 2%，压测 pod 被 limit 限制）
+PodCPUNearLimit      触发采样数 = 0    （Pod 374m/500m = 74%，未到 85%）
+HPAMaxedOut          触发采样数 = 0    （for: 10m，但压测只持续 6.5 分钟）
+```
+
+**原因分析**：
+
+1. `HPAMaxedOut` 的 `for: 10m` 比压测时长的 6.5 分钟还长，永远等不到。
+   已改为 `for: 5m`——这是"阈值必须匹配实际场景时长"的直接教训。
+2. `PodCPUNearLimit` 定 85%，但 CFS 限流让 Pod 稳定在 74%，
+   说明**这个阈值对"被限流"这种状态不够敏感**。真正该看的是
+   `container_cpu_cfs_throttled_periods_total` 的比例，而不是 usage/limit。
+3. `NodeHighCPU` 定 85%，但压测 pod 的 limit 只有 500m，对 2 核节点影响很小。
+
+**结论**：告警阈值不能凭感觉定，要按真实压测数据校准。
+这三条同时暴露了"阈值定得不合理"和"指标选得不对"两类问题。
+
+### 17.7 规则热加载的坑
+
+改完 ConfigMap 后 `kubectl apply` 显示 configured，`POST /-/reload` 返回 200，
+但 `/api/v1/rules` 仍显示旧的 10 条。
+
+原因：**ConfigMap 挂载到 Pod 需要 kubelet 同步（约 30-60 秒）**，
+reload 读的是挂载点里的文件，不是 ConfigMap 对象本身。
+
+验证方法：
+
+```bash
+kubectl -n monitoring exec deploy/prometheus -- \
+  sh -c 'grep -c "alert:" /etc/prometheus/rules/sre-lab-alerts.yml'
+# 等到数字变化后再 reload
+```
+
+这与第 9 课"ConfigMap 变更不重启 Grafana"是同一类问题的不同表现：
+一个需要重启进程，一个只需要等文件同步。

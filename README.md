@@ -16,8 +16,11 @@
 - 多阶段 Dockerfile，容器以非 root 用户运行
 - Kubernetes Deployment 与 Service，包含探针、资源限制和安全上下文
 - GitHub Actions：校验代码、运行测试、构建并推送 GHCR
-- Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics，10 条告警规则与开箱即用的看板
+- Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics，16 条告警规则与开箱即用的看板
+- Loki + Fluent Bit 日志集中收集，Grafana 双数据源（指标 + 日志）
+- metrics-server + HPA，基于 CPU 70% 在 2-5 副本间自动扩缩
 - `scripts/opsctl.py`：集群盘点、健康检查、日志收集、发布、回滚、监控自检
+- `scripts/drills/`：10 个可注入故障场景，用于盲练排查
 
 ## 文档
 
@@ -43,15 +46,19 @@
 
 ```text
 GitHub Actions                      monitoring 命名空间（全部固定在 master）
-    |                                 +-- Prometheus（抓取 7 个 target）
-    | 构建并推送                      +-- Alertmanager（10 条规则的路由）
-    v                                 +-- Grafana（数据源 + 15 面板自动 provisioned）
+    |                                 +-- Prometheus（抓取 7 个 target，16 条告警）
+    | 构建并推送                      +-- Alertmanager
+    v                                 +-- Grafana（Prometheus + Loki 双数据源，15 面板）
 GHCR 镜像                             +-- node-exporter（DaemonSet，hostPort 9100）
     |                                 +-- kube-state-metrics
     v                                 +-- Loki（日志存储，保留 24h）
 Kubernetes 命名空间 sre-lab           +-- Fluent Bit（DaemonSet，采集容器日志）
     +-- Deployment demo-api（2 副本）  <-- prometheus 通过 Pod 注解自动发现
     +-- Service demo-api（ClusterIP）  <-- fluent-bit tail /var/log/containers
+    +-- HPA demo-api（2-5 副本）       <-- 基于 CPU 70%，metrics-server 提供指标
+
+kube-system
+    +-- metrics-server v0.8.0         <-- kubectl top / HPA 的数据来源
 ```
 
 实验集群为 1 个控制面节点 + 1 个工作节点。工作节点约 3.6 GiB 内存，所以监控栈全部

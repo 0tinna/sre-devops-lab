@@ -205,6 +205,85 @@ data:
             annotations:
               summary: '节点 {{ $labels.node }} CPU 使用率超过 85%'
               description: '持续 10 分钟高于 85%，检查是否有异常负载。'
+
+          # 日志采集器掉线：DaemonSet 就绪数少于期望数
+          - alert: LogCollectorDown
+            expr: |
+              kube_daemonset_status_number_ready{namespace="monitoring", daemonset="fluent-bit"}
+                < kube_daemonset_status_desired_number_scheduled{namespace="monitoring", daemonset="fluent-bit"}
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: '日志采集器 {{ $labels.daemonset }} 副本不足'
+              description: '就绪副本少于期望数，部分节点的日志将不再上报到 Loki。'
+
+          # 日志管道停滞：所有采集器都在，但 Loki 长时间没有新日志写入
+          # 用 Loki 自身的 ingestion 指标判断，避免误报（应用真的静默时也会命中）
+          - alert: LokiNotReceivingLogs
+            expr: |
+              sum(rate(loki_distributor_lines_received_total[15m])) == 0
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'Loki 近 15 分钟没有收到任何日志'
+              description: '采集器可能正常但上游无日志，或写入链路中断。结合 LogCollectorDown 判断。'
+
+      - name: autoscaling
+        rules:
+          # HPA 达到最大副本上限：扩不动了，说明容量规划需要调整
+          # for 设为 5m 而不是 10m：实测压测 6.5 分钟就会触顶，
+          # 10 分钟的等待会让告警错过整个压测窗口。
+          - alert: HPAMaxedOut
+            expr: |
+              kube_horizontalpodautoscaler_status_current_replicas{namespace="sre-lab"}
+                >= kube_horizontalpodautoscaler_spec_max_replicas{namespace="sre-lab"}
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'HPA {{ $labels.horizontalpodautoscaler }} 已达最大副本数'
+              description: '持续 5 分钟顶在上限，负载可能超过预期，或 maxReplicas 需要调整。'
+
+          # HPA 无法获取指标：metrics-server 或 metrics API 出问题
+          - alert: HPAUnableToScale
+            expr: |
+              kube_horizontalpodautoscaler_status_condition{
+                namespace="sre-lab", condition="AbleToScale", status="false"
+              } == 1
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'HPA {{ $labels.horizontalpodautoscaler }} 无法扩缩容'
+              description: '检查 metrics-server、APIService 与 Pod 的 resources.requests。'
+
+          # Pod 接近 CPU limit：说明在限流边缘，性能会劣化
+          - alert: PodCPUNearLimit
+            expr: |
+              sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="sre-lab", container!=""}[5m]))
+                / sum by (pod) (kube_pod_container_resource_limits{namespace="sre-lab", resource="cpu"})
+                > 0.85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'Pod {{ $labels.pod }} CPU 接近 limit'
+              description: '超过 limit 会被 CFS 限流，表现为延迟尖刺而非 OOM。'
+
+          # 内存接近 limit：下一步就是 OOMKilled
+          - alert: PodMemoryNearLimit
+            expr: |
+              sum by (pod) (container_memory_working_set_bytes{namespace="sre-lab", container!=""})
+                / sum by (pod) (kube_pod_container_resource_limits{namespace="sre-lab", resource="memory"})
+                > 0.9
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'Pod {{ $labels.pod }} 内存超过 limit 的 90%'
+              description: '接近 OOMKilled 阈值，提前介入比事后重启好。'
 ---
 apiVersion: apps/v1
 kind: Deployment

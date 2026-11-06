@@ -108,6 +108,19 @@ Promtail 的 `kubernetes_sd_configs` 在 K8s v1.34.1 上静默失效（0 targets
 | `NodeMemoryPressure` | 内存使用 > 90% | 5m | warning |
 | `NodeDiskPressure` | 磁盘使用 > 85% | 5m | warning |
 | `NodeHighCPU` | CPU 使用 > 85% | 10m | info |
+| `LogCollectorDown` | fluent-bit 就绪数 < 期望数 | 5m | critical |
+| `LokiNotReceivingLogs` | Loki 15m 无日志写入 | 15m | warning |
+| `HPAMaxedOut` | current >= max replicas | 5m | warning |
+| `HPAUnableToScale` | AbleToScale 条件为 false | 5m | warning |
+| `PodCPUNearLimit` | CPU 使用 / limit > 85% | 5m | warning |
+| `PodMemoryNearLimit` | 内存使用 / limit > 90% | 5m | warning |
+
+共 **16 条**，分 4 组：availability(3)、reliability(4)、capacity(5)、autoscaling(4)。
+
+后 6 条是 P5 补充的，专门覆盖前三层看不到的盲区：
+- `LogCollectorDown` / `LokiNotReceivingLogs`：日志管道自身（上一阶段发现的缺口）
+- `HPAMaxedOut` / `HPAUnableToScale`：自动扩缩容失效
+- `PodCPUNearLimit` / `PodMemoryNearLimit`：接近限流/ OOM 边界，提前介入
 
 Alertmanager 侧：`severity=critical` 走 10s 的 `group_wait` 快通道，其余 30s。
 实验环境没有 SMTP 和外网回调，receiver 是 `blackhole`，**以 Alertmanager UI 的 Firing 列表作为送达证据**。
