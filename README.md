@@ -16,12 +16,15 @@
 - 多阶段 Dockerfile，容器以非 root 用户运行
 - Kubernetes Deployment 与 Service，包含探针、资源限制和安全上下文
 - GitHub Actions：校验代码、运行测试、构建并推送 GHCR
-- Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics，16 条告警规则与开箱即用的看板
+- Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics，20 条告警规则与开箱即用的看板
+- 12 个抓取目标，含 cAdvisor（容器 CPU/内存/OOM）与 Loki 自身指标
 - Loki + Fluent Bit 日志集中收集，Grafana 双数据源（指标 + 日志）
 - metrics-server + HPA，基于 CPU 70% 在 2-5 副本间自动扩缩
 - 可用性加固：PDB、ResourceQuota、LimitRange、PriorityClass、优雅终止、拓扑分布
 - `scripts/opsctl.py`：集群盘点、健康检查、日志收集、发布、回滚、监控自检
-- `scripts/drills/`：10 个可注入故障场景，用于盲练排查
+- `scripts/audit-alerts.py`：审计告警表达式引用的指标是否存在（防"死告警"）
+- `scripts/prewarm-image.sh`：把镜像主动分发到所有节点（2 秒 vs 直连公网 10 分钟）
+- `scripts/drills/`：11 个可注入故障场景，用于盲练排查
 
 ## 文档
 

@@ -15,13 +15,17 @@
 #   ./scripts/prewarm-image.sh --check         # 只检查，不分发（CI 可用）
 #
 # 退出码：0 全部节点已有镜像；1 有节点缺失或分发失败。
-set -euo pipefail
+set -uo pipefail
 
 NS="${NS:-sre-lab}"
 DEPLOY="${DEPLOY:-demo-api}"
-CONTAINERD="unix:///run/containerd/containerd.sock"
-CRICTL="crictl --runtime-endpoint $CONTAINERD"
-SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+# crictl 负责 images / pull / rmi；注意它**没有** export / import 子命令，
+# 那两个是 ctr 的能力，混用会得到一条 crictl 帮助信息而不是镜像。
+CRICTL="crictl --runtime-endpoint unix:///run/containerd/containerd.sock"
+CTR="ctr -n k8s.io"
+# -n 很关键：ssh/scp 默认会读 stdin。若本脚本是通过 ``... | bash`` 管道传入的，
+# 子进程会把剩余脚本当输入吃掉，导致脚本中途中止且没有报错（踩过）。
+SSH_OPTS="-n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
 TARBALL="/tmp/prewarm-image.tar"
 
 PRUNE=0
@@ -48,6 +52,18 @@ fi
 
 SELF="$(hostname)"
 
+# 在指定主机上执行任意 shell 命令（本机直接跑，远端走 ssh）。
+# 统一入口，避免"某类操作只能本机 / 某类只能远端"的分裂。
+on_node() {
+  local host="$1"
+  local cmd="$2"
+  if [ "$host" = "$SELF" ]; then
+    bash -c "$cmd"
+  else
+    ssh $SSH_OPTS "root@$host" "$cmd"
+  fi
+}
+
 echo "=== 镜像分发 ==="
 echo "镜像: $IMAGE"
 echo "本机: $SELF"
@@ -63,30 +79,38 @@ while IFS='|' read -r name ip; do
 done < <(kubectl get nodes \
   -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}')
 
-# 在指定节点上执行 crictl（本机直接跑，远端走 ssh）
-node_crictl() {
-  local host="$1"; shift
-  if [ "$host" = "$SELF" ]; then
-    $CRICTL "$@"
-  else
-    ssh $SSH_OPTS "root@$host" "$CRICTL $* 2>/dev/null"
+# 节点名 -> 访问地址（优先 InternalIP）。
+# 本机必须返回主机名而不是 IP：后续所有"是不是本机"的判断
+# 都拿它和 $SELF 比，返回 IP 会永远判成远端（踩过：master 的
+# InternalIP 是 172.31.6.211，而 SELF 是 master，于是反复尝试
+# scp 到自己，全部失败）。
+addr_of() {
+  local want="$1" i
+  if [ "$want" = "$SELF" ]; then
+    echo "$SELF"
+    return 0
   fi
+  for i in "${!NODE_NAMES[@]}"; do
+    if [ "${NODE_NAMES[$i]}" = "$want" ]; then
+      if [ -n "${NODE_IPS[$i]}" ]; then echo "${NODE_IPS[$i]}"; else echo "$want"; fi
+      return 0
+    fi
+  done
+  echo "$want"
 }
 
 node_has_image() {
   local host="$1"
-  node_crictl "$host" images 2>/dev/null \
-    | awk '{print $1":"$2}' | grep -qx "$IMAGE"
+  on_node "$host" "$CRICTL images 2>/dev/null | awk '{print \$1\":\"\$2}' | grep -qx '$IMAGE'" 2>/dev/null
 }
 
-# 1) 盘点：哪些节点已有镜像
+# 1) 盘点
 echo "--- 盘点 ---"
 declare -a HAVE=()
 declare -a MISS=()
 for i in "${!NODE_NAMES[@]}"; do
   n="${NODE_NAMES[$i]}"
-  h="${NODE_IPS[$i]}"
-  [ -n "$h" ] || h="$n"
+  h="$(addr_of "$n")"
   if node_has_image "$h"; then
     HAVE+=("$n")
     printf '  ✓ %-10s 已有\n' "$n"
@@ -112,94 +136,83 @@ else
   # 2) 选源节点
   if [ "${#HAVE[@]}" -gt 0 ]; then
     SRC_NAME="${HAVE[0]}"
-    SRC_IP=""
-    for i in "${!NODE_NAMES[@]}"; do
-      [ "${NODE_NAMES[$i]}" = "$SRC_NAME" ] && SRC_IP="${NODE_IPS[$i]}"
-    done
-    [ -n "$SRC_IP" ] || SRC_IP="$SRC_NAME"
-    echo "--- 源节点: $SRC_NAME ($SRC_IP) ---"
-    echo "--- 导出镜像 ---"
-    start=$(date +%s)
-    node_crictl "$SRC_IP" images export --platform linux/amd64 "$TARBALL" "$IMAGE" >/dev/null 2>&1 || {
-      echo "  导出失败（源节点 $SRC_NAME）" >&2
-      exit 1
-    }
-    SIZE=$(node_crictl "$SRC_IP" sh -c "ls -lh $TARBALL 2>/dev/null | awk '{print \$5}'" 2>/dev/null || echo '?')
-    echo "  完成，大小 ${SIZE:-?}，耗时 $(( $(date +%s) - start ))s"
-    echo
   else
-    echo "--- 没有任何节点有该镜像，直接在第一个节点拉取（可能很慢）---"
-    FIRST_IP="${NODE_IPS[0]}"
+    echo "--- 没有任何节点有该镜像，在第一个节点拉取（可能很慢）---"
     SRC_NAME="${NODE_NAMES[0]}"
-    SRC_IP="$FIRST_IP"
-    [ -n "$SRC_IP" ] || SRC_IP="$SRC_NAME"
+    FIRST_IP="$(addr_of "$SRC_NAME")"
     start=$(date +%s)
-    node_crictl "$SRC_IP" pull "$IMAGE" >/dev/null 2>&1 || {
+    if ! on_node "$FIRST_IP" "$CRICTL pull '$IMAGE'"; then
       echo "  拉取失败；考虑先在任一节点手动拉取，或用内网 registry" >&2
       exit 1
-    }
-    echo "  完成，耗时 $(( $(date +%s) - start ))s"
-    node_crictl "$SRC_IP" images export --platform linux/amd64 "$TARBALL" "$IMAGE" >/dev/null 2>&1
-    MISS=("${NODE_NAMES[@]}")
-    HAVE=()
-    echo
+    fi
+    echo "  拉取完成，耗时 $(( $(date +%s) - start ))s"
+    HAVE=("$SRC_NAME")
+    MISS=()
+    for n in "${NODE_NAMES[@]}"; do
+      [ "$n" = "$SRC_NAME" ] || MISS+=("$n")
+    done
   fi
 
-  # 3) 分发到缺失节点
-  echo "--- 分发 ---"
-  for target in "${MISS[@]}"; do
-    tip=""
-    for i in "${!NODE_NAMES[@]}"; do
-      [ "${NODE_NAMES[$i]}" = "$target" ] && tip="${NODE_IPS[$i]}"
-    done
-    [ -n "$tip" ] || tip="$target"
+  SRC_IP="$(addr_of "$SRC_NAME")"
+  echo "--- 源节点: $SRC_NAME ($SRC_IP) ---"
 
+  # 3) 导出
+  echo "--- 导出镜像 ---"
+  start=$(date +%s)
+  if ! on_node "$SRC_IP" "$CTR images export --platform linux/amd64 '$TARBALL' '$IMAGE'"; then
+    echo "  导出失败（源节点 $SRC_NAME）" >&2
+    on_node "$SRC_IP" "rm -f $TARBALL" >/dev/null 2>&1
+    exit 1
+  fi
+  SIZE=$(on_node "$SRC_IP" "ls -lh '$TARBALL' 2>/dev/null | awk '{print \$5}'" 2>/dev/null)
+  if [ -z "$SIZE" ]; then
+    echo "  导出后找不到 $TARBALL（源节点 $SRC_NAME）" >&2
+    exit 1
+  fi
+  echo "  完成，大小 ${SIZE}，耗时 $(( $(date +%s) - start ))s"
+  echo
+
+  # 4) 分发到缺失节点
+  echo "--- 分发 ---"
+  FAILED=0
+  for target in "${MISS[@]}"; do
+    tip="$(addr_of "$target")"
     printf '  → %-10s ' "$target"
     start=$(date +%s)
 
-    if [ "$tip" = "$SELF" ]; then
-      # 源在远端，目标是本机：从源 scp 过来
-      scp $SSH_OPTS "root@$SRC_IP:$TARBALL" "$TARBALL" >/dev/null 2>&1 || {
-        printf '失败（scp）\n'; continue;
-      }
-    elif [ "$SRC_IP" = "$SELF" ]; then
-      # 源在本机，目标是远端：scp 过去
-      scp $SSH_OPTS "$TARBALL" "root@$tip:$TARBALL" >/dev/null 2>&1 || {
-        printf '失败（scp）\n'; continue;
-      }
-    else
-      # 源和目标都是远端：借本机中转，避免节点间直连依赖
-      scp $SSH_OPTS "root@$SRC_IP:$TARBALL" "$TARBALL" >/dev/null 2>&1 \
-        && scp $SSH_OPTS "$TARBALL" "root@$tip:$TARBALL" >/dev/null 2>&1 || {
-        printf '失败（scp 中转）\n'; continue;
-      }
+    # 统一借本机中转：源 → 本机 → 目标。
+    # 不依赖节点之间的直连 SSH，也不要求源和目标谁能连谁。
+    if [ "$SRC_IP" != "$SELF" ]; then
+      if ! scp ${SSH_OPTS/-n/} "root@$SRC_IP:$TARBALL" "$TARBALL" </dev/null >/dev/null 2>&1; then
+        printf '失败（从源拉取）\n'; FAILED=1
+        continue
+      fi
+    fi
+    if [ "$tip" != "$SELF" ]; then
+      if ! scp ${SSH_OPTS/-n/} "$TARBALL" "root@$tip:$TARBALL" </dev/null >/dev/null 2>&1; then
+        printf '失败（推送到目标）\n'; FAILED=1
+        continue
+      fi
     fi
 
-    if node_crictl "$tip" images import --platform linux/amd64 "$TARBALL" >/dev/null 2>&1; then
+    if on_node "$tip" "$CTR images import --platform linux/amd64 '$TARBALL'" >/dev/null 2>&1; then
       printf '完成 %ss\n' "$(( $(date +%s) - start ))"
     else
-      printf '失败（import）\n'
+      printf '失败（import）\n'; FAILED=1
     fi
-
-    # 远端临时文件清理
-    [ "$tip" != "$SELF" ] && ssh $SSH_OPTS "root@$tip" "rm -f $TARBALL" >/dev/null 2>&1 || true
+    on_node "$tip" "rm -f $TARBALL" >/dev/null 2>&1
   done
 
-  # 源节点临时文件清理
-  if [ "$SRC_IP" = "$SELF" ]; then
-    rm -f "$TARBALL"
-  else
-    ssh $SSH_OPTS "root@$SRC_IP" "rm -f $TARBALL" >/dev/null 2>&1 || true
-  fi
+  # 清理：本机与源节点
+  [ "$SRC_IP" != "$SELF" ] && on_node "$SRC_IP" "rm -f $TARBALL" >/dev/null 2>&1
+  rm -f "$TARBALL"
   echo
 
-  # 4) 复验
+  # 5) 复验
   echo "--- 复验 ---"
-  FAILED=0
   for i in "${!NODE_NAMES[@]}"; do
     n="${NODE_NAMES[$i]}"
-    h="${NODE_IPS[$i]}"
-    [ -n "$h" ] || h="$n"
+    h="$(addr_of "$n")"
     if node_has_image "$h"; then
       printf '  ✓ %-10s 已有\n' "$n"
     else
@@ -212,22 +225,18 @@ else
     echo "结果: 有节点仍缺失镜像" >&2
     exit 1
   fi
-
   echo "结果: 全部节点已就绪"
 fi
 
-# 5) 可选：清理旧版本镜像
+# 6) 可选：清理旧版本镜像
 if [ "$PRUNE" -eq 1 ]; then
   echo
-  echo "--- 清理旧版本 sre-devops 镜像（保留当前 $IMAGE）---"
+  echo "--- 清理旧版本镜像（保留当前 $IMAGE）---"
   REPO="${IMAGE%:*}"
   for i in "${!NODE_NAMES[@]}"; do
     n="${NODE_NAMES[$i]}"
-    h="${NODE_IPS[$i]}"
-    [ -n "$h" ] || h="$n"
-    # 列出同仓库但非当前 tag 的镜像
-    STALE=$(node_crictl "$h" images 2>/dev/null \
-      | awk -v repo="$REPO" -v keep="$IMAGE" '$1 == repo && ($1":"$2) != keep {print $1":"$2}' || true)
+    h="$(addr_of "$n")"
+    STALE=$(on_node "$h" "$CRICTL images 2>/dev/null | awk -v repo='$REPO' -v keep='$IMAGE' '\$1 == repo && (\$1\":\"\$2) != keep {print \$1\":\"\$2}'" 2>/dev/null)
     if [ -z "$STALE" ]; then
       printf '  %-10s 无旧版本\n' "$n"
       continue
@@ -235,9 +244,7 @@ if [ "$PRUNE" -eq 1 ]; then
     COUNT=0
     while IFS= read -r ref; do
       [ -n "$ref" ] || continue
-      if node_crictl "$h" rmi "$ref" >/dev/null 2>&1; then
-        COUNT=$((COUNT + 1))
-      fi
+      on_node "$h" "$CRICTL rmi '$ref'" >/dev/null 2>&1 && COUNT=$((COUNT + 1))
     done <<< "$STALE"
     printf '  %-10s 清理 %s 个旧版本\n' "$n" "$COUNT"
   done

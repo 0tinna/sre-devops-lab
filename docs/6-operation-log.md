@@ -1031,3 +1031,261 @@ tail -20 /tmp/recover.log
 | master 镜像导入 | 45 MB / 17 秒 |
 | 直接 pull 对比 | >600 秒未完成 |
 | PDB 阻断驱逐次数 | 第一次 drain 中 16+ 次 |
+
+## 19. 2026-11-06 14:10–15:00 P7 死告警审计与容器级指标
+
+### 19.1 起因：一次顺手的审计
+
+P6 收尾时想确认"还有没有别的告警缺口"，于是查了 kube-state-metrics 暴露的指标。
+结果发现两件比预想严重的事。
+
+**第一件**：`--resources` 是个**白名单**，当前值是
+
+```text
+pods,deployments,replicasets,statefulsets,daemonsets,nodes,namespaces,
+services,endpoints,persistentvolumes,persistentvolumeclaims,jobs,cronjobs
+```
+
+里面**没有** `horizontalpodautoscalers` 和 `poddisruptionbudgets`。
+这意味着 P5 写的 `HPAMaxedOut` / `HPAUnableToScale` 引用的
+`kube_horizontalpodautoscaler_*` 根本不存在——两条告警从写下的那一刻就是死的。
+
+**第二件**：整个 Prometheus 只有 **7 个 target**，没有 cAdvisor，也没有 Loki。
+所以 `PodCPUNearLimit`、`PodMemoryNearLimit`、`LokiNotReceivingLogs`
+同样引用了不存在的指标。
+
+### 19.2 死告警的隐蔽性
+
+这类问题的可怕之处在于**所有常规检查都能通过**：
+
+| 检查 | 结果 |
+| --- | --- |
+| YAML 语法 | 合法 |
+| `promtool check rules` | 通过 |
+| `/api/v1/rules` 的 health | 全部 `ok` |
+| `/api/v1/alerts` | 不报错，只是永远为空 |
+| 告警界面 | 一切正常，绿油油 |
+
+**"没触发"和"不可能触发"在监控上长得一模一样。**
+
+### 19.3 写一个审计工具
+
+与其人工核对，不如让机器做。`scripts/audit-alerts.py`：
+
+1. 从 Prometheus 拉全部规则表达式
+2. 从 `/api/v1/label/__name__/values` 拉全部真实存在的指标名
+3. 从表达式里抽出形如 `metric{` 的标识符（最可靠的指标引用形式）
+4. 比对，报出引用了不存在指标的告警
+
+首次运行结果：
+
+```text
+[autoscaling]
+  ✗ PodCPUNearLimit      health=ok  缺失指标: container_cpu_usage_seconds_total
+  ✗ PodMemoryNearLimit   health=ok  缺失指标: container_memory_working_set_bytes
+[reliability]
+  ✗ ContainerOOMKilled   health=ok  缺失指标: kube_pod_container_status_last_terminated_reason
+[capacity]
+      疑似未知标识符: loki_distributor_lines_received_total
+结果: 3/16 条告警引用了不存在的指标 —— 这些告警永远不会触发
+```
+
+工具还区分了**条件性指标**：`kube_pod_container_status_last_terminated_reason`
+这类只在"事件发生过"时才存在的指标，缺席是正常的，标 `~` 而不是 `✗`：
+
+```text
+  ~ ContainerOOMKilled   health=ok  条件性指标当前无事件: kube_pod_container_status_last_terminated_reason
+```
+
+### 19.4 修复：三个新抓取目标
+
+原来只有 7 个 target，容器级指标一个都没有。补上三个 job：
+
+| job | 采集什么 | 关键点 |
+| --- | --- | --- |
+| `kubelet-cadvisor` | 容器 CPU/内存/OOM 事件 | 走 apiserver 代理 `/api/v1/nodes/<n>/proxy/metrics/cadvisor` |
+| `kubelet` | kubelet 自身，含 `kubelet_image_pull_duration_seconds` | 同上 |
+| `loki` | Loki 自身指标 | 静态目标 `loki:3100` |
+
+**为什么走 apiserver 代理而不是直连 10250**：
+
+```yaml
+relabel_configs:
+  - target_label: __address__
+    replacement: 'kubernetes.default.svc:443'
+  - source_labels: ['__meta_kubernetes_node_name']
+    target_label: __metrics_path__
+    replacement: '/api/v1/nodes/${1}/proxy/metrics/cadvisor'
+```
+
+这样不需要直连 kubelet 端口、不需要单独配 kubelet 证书，
+只需要 ServiceAccount 有 `nodes/proxy` 权限（RBAC 里早就有了）。
+
+**结果**：target 从 7 个变成 **12 个**，全部 up。
+
+```text
+kubelet              node      up
+kubelet              master    up
+kubelet-cadvisor     node      up
+kubelet-cadvisor     master    up
+loki                 ...       up
+```
+
+指标从 744 个涨到 **1348 个**。
+
+### 19.5 新增 4 条告警（16 → 20）
+
+| 告警 | 表达式要点 | 它补的是哪个盲区 |
+| --- | --- | --- |
+| `PDBBlocksMaintenance` | `pod_disruptions_allowed <= 0` | 场景 11：服务正常但无法维护 |
+| `PodImagePullFailed` | `waiting_reason{ErrImagePull…}` | 场景 5：只靠肉眼发现 |
+| `ImagePullSlow` | kubelet 拉取 P90 > 120s | 镜像分发热点 |
+| `ContainerOOMEvents` | `container_oom_events_total` 增量 | 见 19.7 |
+
+审计复跑：
+
+```text
+结果: 20 条告警引用的指标全部存在且非条件性
+audit 退出码=0
+```
+
+### 19.6 镜像分发脚本，以及它自己踩的 3 个坑
+
+`scripts/prewarm-image.sh` 把镜像主动推到所有节点。写的过程本身踩了三个坑，
+都很有代表性：
+
+**坑 1：`crictl` 没有 `export` / `import`**
+
+第一版写成 `crictl images export ...`，实际输出是 crictl 的帮助文本——
+因为这两个子命令属于 `ctr`，不属于 `crictl`。
+
+```bash
+CRICTL="crictl --runtime-endpoint unix:///run/containerd/containerd.sock"  # images/pull/rmi
+CTR="ctr -n k8s.io"                                                        # export/import
+```
+
+**坑 2：用 IP 和主机名比较**
+
+`addr_of master` 返回 `172.31.6.211`，而 `SELF` 是 `master`，
+于是 `"$tip" != "$SELF"` 恒为真，脚本反复尝试 `scp` 到本机自己，全部失败。
+
+修法：本机必须返回主机名而不是 IP。
+
+**坑 3：`ssh`/`scp` 吃掉调用方的 stdin**
+
+脚本是通过 `echo $b64 | base64 -d | bash` 传入的，bash 的 stdin 就是脚本流。
+脚本内部一执行 `scp`，scp 把**剩余脚本当输入吃掉**，脚本中途中止且**没有任何报错**。
+
+```bash
+# 修法：ssh 加 -n，scp 加 </dev/null
+SSH_OPTS="-n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+scp ${SSH_OPTS/-n/} src dst </dev/null
+```
+
+**这和第 9 课的"管道吞掉退出码"是同一个家族的坑**：管道让生产端提前死亡，
+而你看到的输出和退出码都是下游的。
+
+修完实测：
+
+```text
+--- 盘点 ---
+  ✗ master     缺失
+  ✓ node       已有
+--- 导出镜像 ---
+  完成，大小 45M，耗时 1s
+--- 分发 ---
+  → master     完成 1s
+--- 复验 ---
+  ✓ master     已有
+  ✓ node       已有
+结果: 全部节点已就绪
+```
+
+**总耗时 2 秒**，对比直连 ghcr.io 的 600 秒未完成。
+
+### 19.7 顺手发现的真实 bug：`/simulate/memory` 没在分配内存
+
+想验证 `ContainerOOMKilled` 时，调用 `/simulate/memory?mib=400&hold=8`，
+容器 limit 是 256Mi，理应 OOM——结果什么都没发生。
+
+看代码：
+
+```python
+block = b'x' * (1024 * 1024)
+chunks = [block for _ in range(max(mib, 0))]   # ← 问题在这
+```
+
+这是**对同一个 1MiB bytes 对象的 mib 个引用**，不是 mib 份拷贝。
+无论传多少，实际只占 1MiB。
+
+```python
+# 修法：逐个创建独立对象
+chunks = [bytearray(1024 * 1024) for _ in range(mib)]
+for buf in chunks:
+    buf[0] = 1          # 写入，防止懒分配被优化
+```
+
+这个 bug 让"演练 OOM"这个功能静默失效——端点返回 200，日志正常，
+但内存根本没涨。**故障注入工具本身失效，是最难发现的**，
+因为你会以为"演练过了，系统没问题"。
+
+### 19.8 OOM 告警的实测对比
+
+修复后重新触发，这次真 OOM 了：
+
+```text
+command terminated with exit code 137     ← SIGKILL
+restartCount: 0 → 1
+```
+
+告警侧结果：
+
+| 告警 | 结果 | 说明 |
+| --- | --- | --- |
+| `ContainerOOMKilled` | **firing**，Alertmanager 已收到 | 依赖 ksm 的 last_terminated_reason |
+| `ContainerOOMEvents` | 未触发（指标为 0） | 见下 |
+| `ImagePullSlow` | pending | 真实捕获到一次 174s 的慢拉取 |
+
+**`ContainerOOMEvents` 为什么没触发**：容器整个重启后，
+cAdvisor 里旧容器的 `container_oom_events_total` 随容器消失，新容器从 0 开始。
+所以"容器被杀"这类 OOM 只有 `ContainerOOMKilled` 能抓到。
+
+它真正的价值在**另一种场景**：gunicorn 多 worker 时，OOM 只杀掉一个 worker，
+master 立刻补位，**容器根本不重启**——这时 ksm 的 `last_terminated_reason` 为空，
+只有 cAdvisor 的 OOM 计数能反映。这个场景本次未能构造出来，
+**如实标注为未验证**。
+
+### 19.9 ImagePullSlow 的意外验证
+
+`ImagePullSlow` 上线后立刻 pending，查数据：
+
+```text
+P90 拉取耗时（秒）:
+  node   = 174.0
+  master = nan
+```
+
+174 秒——正是刚才把新镜像部署到 node 时从 ghcr.io 拉的耗时。
+**告警没用造数据，直接抓到了真实的慢拉取。**
+
+这也反过来印证了 P6 的结论：直连公网拉镜像就是分钟级，
+所以必须预热或走内网 registry。
+
+### 19.10 P7 数据汇总
+
+| 项 | 前 | 后 |
+| --- | --- | --- |
+| Prometheus target | 7 | **12** |
+| 可用指标数 | 744 | **1348** |
+| 告警条数 | 16 | **20** |
+| 死告警 | 3（+2 隐性） | **0** |
+| 镜像跨节点分发 | 手动、>600s | **脚本 2s** |
+| OOM 演练 | 静默失效 | 可用 |
+
+审计命令（可作为 CI 步骤）：
+
+```bash
+kubectl -n monitoring port-forward svc/prometheus 9090:9090 &
+python3 scripts/audit-alerts.py --url http://127.0.0.1:9090
+python3 scripts/prewarm-image.sh --check
+```

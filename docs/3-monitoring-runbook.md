@@ -114,13 +114,39 @@ Promtail 的 `kubernetes_sd_configs` 在 K8s v1.34.1 上静默失效（0 targets
 | `HPAUnableToScale` | AbleToScale 条件为 false | 5m | warning |
 | `PodCPUNearLimit` | CPU 使用 / limit > 85% | 5m | warning |
 | `PodMemoryNearLimit` | 内存使用 / limit > 90% | 5m | warning |
+| `PDBBlocksMaintenance` | ALLOWED DISRUPTIONS <= 0 | 30m | warning |
+| `PodImagePullFailed` | waiting_reason 为拉取错误 | 5m | critical |
+| `ImagePullSlow` | kubelet 拉取 P90 > 120s | 10m | warning |
+| `ContainerOOMEvents` | cAdvisor OOM 计数增量 > 0 | — | critical |
 
-共 **16 条**，分 4 组：availability(3)、reliability(4)、capacity(5)、autoscaling(4)。
+共 **20 条**，分 4 组：availability(4)、reliability(6)、capacity(6)、autoscaling(4)。
 
-后 6 条是 P5 补充的，专门覆盖前三层看不到的盲区：
-- `LogCollectorDown` / `LokiNotReceivingLogs`：日志管道自身（上一阶段发现的缺口）
-- `HPAMaxedOut` / `HPAUnableToScale`：自动扩缩容失效
-- `PodCPUNearLimit` / `PodMemoryNearLimit`：接近限流/ OOM 边界，提前介入
+**注意 kube-state-metrics 的 `--resources` 是白名单**：
+不在列表里的资源完全不会产生指标，依赖它的告警会静默失效。
+当前白名单必须包含 `horizontalpodautoscalers` 和 `poddisruptionbudgets`。
+
+用下面的命令定期审计（能发现"health=ok 但永远不会触发"的死告警）：
+
+```bash
+kubectl -n monitoring port-forward svc/prometheus 9090:9090 &
+python3 scripts/audit-alerts.py --url http://127.0.0.1:9090
+```
+
+### 抓取目标（12 个）
+
+| job | 用途 |
+| --- | --- |
+| `prometheus` / `alertmanager` | 自身指标 |
+| `demo-api` | 业务指标（Pod 注解自动发现） |
+| `node-exporter` | 节点 CPU/内存/磁盘 |
+| `kube-state-metrics` | K8s 对象状态 |
+| `kubelet-cadvisor` | **容器级 CPU/内存/OOM**（走 apiserver 代理） |
+| `kubelet` | kubelet 自身，含镜像拉取耗时 |
+| `loki` | Loki 自身（日志管道健康） |
+
+`kubelet-cadvisor` 与 `kubelet` 都通过
+`/api/v1/nodes/<node>/proxy/metrics[...]` 抓取，不需要直连 kubelet 10250，
+也不需要单独配置 kubelet 证书，只需 ServiceAccount 有 `nodes/proxy` 权限。
 
 Alertmanager 侧：`severity=critical` 走 10s 的 `group_wait` 快通道，其余 30s。
 实验环境没有 SMTP 和外网回调，receiver 是 `blackhole`，**以 Alertmanager UI 的 Firing 列表作为送达证据**。
