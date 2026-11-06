@@ -152,6 +152,25 @@ def simulate_degraded():
     )
 
 
+@app.get('/simulate/cpu')
+def simulate_cpu():
+    """受控 CPU 负载，用于验证 HPA 扩容。
+
+    参数：ms=每个请求占用的毫秒数（默认 100）。
+    实现是纯计算循环，不 sleep，所以会真实占用 CPU。
+    """
+    if not FAULT_ENDPOINTS_ENABLED:
+        return _fault_disabled()
+    ms = max(0, min(int(request.args.get('ms', '100')), 5000))
+    deadline = time.perf_counter() + ms / 1000.0
+    iterations = 0
+    acc = 0
+    while time.perf_counter() < deadline:
+        acc = (acc * 1103515245 + 12345) & 0x7FFFFFFF
+        iterations += 1
+    return jsonify(burned_ms=ms, iterations=iterations, checksum=acc % 1000)
+
+
 @app.get('/metrics')
 def metrics():
     return Response(generate_latest(METRICS_REGISTRY), mimetype=CONTENT_TYPE_LATEST)
