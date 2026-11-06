@@ -1271,7 +1271,39 @@ P90 拉取耗时（秒）:
 这也反过来印证了 P6 的结论：直连公网拉镜像就是分钟级，
 所以必须预热或走内网 registry。
 
-### 19.10 P7 数据汇总
+### 19.10 又一个反模式：永不消解的告警
+
+OOM 测试做完 7 分钟后，发现 `ContainerOOMKilled` **还在 firing**：
+
+```text
+ContainerOOMKilled firing 从 2026-11-06T06:46:47 开始   （已持续 424 秒）
+kube_pod_container_status_last_terminated_timestamp 距今 424 秒
+```
+
+根因：`kube_pod_container_status_last_terminated_reason` 是**持久状态**，
+不是事件。容器只要 OOM 过一次，这条指标就一直是 1，
+表达式 `reason == "OOMKilled"` 于是永远为真。
+
+**后果比"没告警"更糟**：告警永不消解 → 值班的人学会忽略它 → 下一次真出事也没人看。
+
+修法：用 `last_terminated_timestamp` 加时间窗，让告警能自动恢复。
+
+```promql
+kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+  and on(namespace, pod, container)
+    (time() - kube_pod_container_status_last_terminated_timestamp < 3600)
+```
+
+| 指标类型 | 告警写法 | 例子 |
+| --- | --- | --- |
+| **事件型**（计数器） | `increase(...[5m]) > 0` | `container_oom_events_total` |
+| **状态型**（gauge） | `状态 == 坏值` + `for: 时长` | `up == 0`、`phase == Pending` |
+| **持久状态型** | `状态 == 坏值` **且** `时间窗内` | 本节这条 |
+
+**判断口诀**：告警写完后问一句"它在问题消失后会自己变回 false 吗？"
+不会，就是持久状态型，必须加时间窗。
+
+### 19.11 P7 数据汇总
 
 | 项 | 前 | 后 |
 | --- | --- | --- |

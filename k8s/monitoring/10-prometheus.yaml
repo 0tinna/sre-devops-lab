@@ -228,18 +228,23 @@ data:
               description: '15 分钟内重启次数超过 3 次，检查容器退出原因与 OOM。'
 
           # 容器 OOM 被杀
-          # 注意：kube_pod_container_status_last_terminated_reason 只在容器
+          # 注意 1：kube_pod_container_status_last_terminated_reason 只在容器
           # **曾经终止过** 时才存在。当前没有容器重启时这条指标为空，
           # 告警不触发是正确的，不要误判为"指标缺失"。
+          # 注意 2：它是**持久状态**，不是事件。只写 reason=="OOMKilled"
+          # 会导致一次 OOM 之后永久 firing（实测连续告警 7 分钟以上不消解）。
+          # 必须用 last_terminated_timestamp 加时间窗，让它能自动恢复。
           - alert: ContainerOOMKilled
             expr: |
               kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+                and on(namespace, pod, container)
+                  (time() - kube_pod_container_status_last_terminated_timestamp < 3600)
             for: 1m
             labels:
               severity: critical
             annotations:
               summary: '容器 {{ $labels.container }} 曾因 OOM 被杀'
-              description: '内存 limit 可能过小，或应用存在内存泄漏。'
+              description: '内存 limit 可能过小，或应用存在内存泄漏。1 小时内发生过 OOM 才会告警。'
 
           # 镜像拉取失败：Tag 写错、仓库不可达、认证失败。
           # 演练场景 5 就靠这条。同理，waiting_reason 指标只在
