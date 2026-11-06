@@ -26,6 +26,12 @@ spec:
         prometheus.io/port: '8080'
         prometheus.io/path: '/metrics'
     spec:
+      # 关键业务：节点资源紧张时优先保留
+      priorityClassName: sre-lab-critical
+      # 优雅终止：给 gunicorn 时间处理完在途请求。
+      # preStop sleep 让 Endpoint 先摘除，避免请求打到正在关闭的 Pod；
+      # 总时长 = preStop 5s + 应用自身退出时间，留 30s 余量。
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -33,6 +39,29 @@ spec:
         fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
+      # worker 节点不可用时的兜底：允许调度到控制面。
+      # 实验环境只有 1 个 worker，不加这个 toleration 就是单点。
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          # 正常情况下只去 worker，master 仅作为故障兜底
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      # 副本尽量分散到不同节点；只有 1 个可用节点时允许不满足（ScheduleAnyway）
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: demo-api
       containers:
         - name: demo-api
           image: ghcr.io/0tinna/sre-devops-lab:latest
@@ -62,6 +91,14 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+          # startupProbe 保护启动阶段：最长容忍 60 秒（30 × 2s）。
+          # 启动期间 liveness 不会介入，避免"启动慢被当成挂了"。
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
           readinessProbe:
             httpGet:
               path: /readyz
@@ -74,6 +111,11 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec:
+                # 等 kube-proxy 完成 Endpoint 摘除，再让进程退出
+                command: ['/bin/sh', '-c', 'sleep 5']
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

@@ -1413,3 +1413,132 @@ promtail_targets_active_total 0
 **共同点**：都是"配置看起来对、但版本不匹配"，报错信息通常指向别处。
 
 ---
+
+## 附录 E · 可用性配置的"正确的失败"
+
+**这一节讲的是"每个组件都按设计工作，但整体结果是故障"的情况。**
+
+配置全对、行为全对、日志里全是 Normal 事件，但运维目标没有达成。
+
+### E.1 现象
+
+执行 `kubectl drain node` 做节点维护，卡住 4 分钟超时失败：
+
+```text
+evicting pod sre-lab/demo-api-xxx
+error when evicting pods/"demo-api-yyy" (will retry after 5s):
+  Cannot evict pod as it would violate the pod's disruption budget.
+pod/demo-api-xxx evicted
+...（此后 16 次重试，全部被拒）
+error: unable to drain node "node": global timeout reached: 4m0s
+```
+
+### E.2 三个机制各自都在正确工作
+
+拆开看，每个组件的行为都符合设计：
+
+| 组件 | 配置 | 实际行为 | 是否正确 |
+| --- | --- | --- | --- |
+| PDB | `minAvailable: 1` | 驱逐第 1 个后 `ALLOWED DISRUPTIONS` 1→0，拦住第 2 个 | ✅ |
+| toleration | 容忍 control-plane taint | 新副本被调度到 master | ✅ |
+| nodeAffinity | 偏好非 control-plane | 优先级低于 toleration，故障时允许去 master | ✅ |
+| 事件 | — | 全是 `Normal Scheduled` / `Normal Pulling` | ✅ |
+
+**没有一条错误日志，没有一条 Warning 事件。**
+
+### E.3 真正的死锁
+
+问题出在新副本起不来：
+
+```text
+Normal  Scheduled  4m28s  Successfully assigned sre-lab/demo-api-d75zs to master
+Normal  Pulling    4m28s  kubelet  Pulling image "ghcr.io/..."
+（之后没有任何进展）
+```
+
+master 节点本地没有这个镜像，正在从公网拉，而网络极慢。
+
+于是形成循环依赖：
+
+```text
+PDB 要等新副本 Ready  →  才允许驱逐第 2 个
+新副本 Ready          →  要等镜像拉完
+镜像拉完              →  要等很久很久
+─────────────────────────────────────
+结果：drain 永远完不成
+```
+
+### E.4 核心教训
+
+> **PDB 保证的是"可用副本数不低于 minAvailable"，
+> 但它不保证这个保证能在可接受的时间内兑现。**
+
+数值上 PDB 是对的：全程确实有 1 个副本可用。但运维体感是"卡住了"。
+
+**这是 SRE 里很典型的一类问题：指标全绿、事件全 Normal、目标没达成。**
+
+| 你以为 PDB 保证的 | PDB 实际保证的 |
+| --- | --- |
+| 维护时服务不中断 | 维护时可用副本数不低于阈值 |
+| 维护能顺利完成 | 只有在"替身能及时就绪"时才顺利 |
+| 有兜底就安全 | 兜底本身也可能起不来 |
+
+### E.5 判断流程
+
+遇到"drain / rollout 卡住但不报错"：
+
+```text
+① kubectl get pdb          → 看 ALLOWED DISRUPTIONS 是否为 0
+   为 0 → PDB 正在保护，正常行为，问题在别处
+
+② kubectl get pods -o wide → 新副本调度到哪了？是什么状态？
+   ContainerCreating  → 进 ③
+   Pending            → 调度问题（资源/亲和/污点）
+   CrashLoopBackOff   → 启动问题
+
+③ kubectl describe pod     → 看 Events
+   Pulling image 卡住  → 镜像分发问题（本节情况）
+   FailedMount         → 存储问题
+   FailedScheduling    → 回到 ② 的 Pending
+
+④ 验证镜像分发速度：
+   在有镜像的节点导出 → 传到目标节点 → 导入
+   对比直接 pull 的耗时
+```
+
+### E.6 预防清单
+
+| 措施 | 说明 |
+| --- | --- |
+| **镜像预热** | 部署流程里主动把镜像分发到所有可能调度的节点 |
+| **本地 registry** | 内网 Harbor/registry，避免每次都回源公网 |
+| **提前演练 drain** | 别等真维护才发现；演练成本远低于事故成本 |
+| **放宽 PDB** | 2 副本配 `minAvailable: 1` 已经很紧，考虑 `maxUnavailable` |
+| **监控镜像拉取耗时** | 给 kubelet 的 image pull 加指标或至少记录基线 |
+
+镜像搬运的实测对比（同一集群）：
+
+| 方式 | 耗时 |
+| --- | --- |
+| `crictl pull` 直连 ghcr.io | **>600 秒未完成** |
+| node 导出 → 内网 scp → master 导入 | **22 秒**（45 MB） |
+
+**差了两个数量级。** 跨节点分发镜像走内网，永远比回源公网快。
+
+### E.7 相关：看似成功的验证也可能骗人
+
+同一次工作中还踩到一个调试陷阱：探针 Pod 用 `while ...; do echo ...; done`
+往 stdout 写结果，`kubectl logs` 一直是空的，但服务实际被测了 298 次。
+
+原因：容器内 sh 的 stdout 是块缓冲，进程还在 sleep，缓冲区没刷出来。
+
+**长驻脚本的进度必须落盘**：
+
+```bash
+echo "t=$(date +%H:%M:%S) ok=$ok" > /probe/result.log   # 可靠
+kubectl exec pod -- cat /probe/result.log
+```
+
+这与本附录的主题一致：**"我没看到证据"和"没有发生"是两件事**。
+
+---

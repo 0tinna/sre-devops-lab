@@ -19,6 +19,7 @@
 - Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics，16 条告警规则与开箱即用的看板
 - Loki + Fluent Bit 日志集中收集，Grafana 双数据源（指标 + 日志）
 - metrics-server + HPA，基于 CPU 70% 在 2-5 副本间自动扩缩
+- 可用性加固：PDB、ResourceQuota、LimitRange、PriorityClass、优雅终止、拓扑分布
 - `scripts/opsctl.py`：集群盘点、健康检查、日志收集、发布、回滚、监控自检
 - `scripts/drills/`：10 个可注入故障场景，用于盲练排查
 
@@ -54,8 +55,13 @@ GHCR 镜像                             +-- node-exporter（DaemonSet，hostPort
     v                                 +-- Loki（日志存储，保留 24h）
 Kubernetes 命名空间 sre-lab           +-- Fluent Bit（DaemonSet，采集容器日志）
     +-- Deployment demo-api（2 副本）  <-- prometheus 通过 Pod 注解自动发现
+    |     +-- startup/readiness/liveness 三层探针
+    |     +-- preStop + grace 30s（优雅终止）
+    |     +-- priorityClass: sre-lab-critical
     +-- Service demo-api（ClusterIP）  <-- fluent-bit tail /var/log/containers
     +-- HPA demo-api（2-5 副本）       <-- 基于 CPU 70%，metrics-server 提供指标
+    +-- PodDisruptionBudget（minAvailable 1）
+    +-- ResourceQuota（4 CPU / 4Gi）+ LimitRange（默认值与上限）
 
 kube-system
     +-- metrics-server v0.8.0         <-- kubectl top / HPA 的数据来源
@@ -64,6 +70,9 @@ kube-system
 实验集群为 1 个控制面节点 + 1 个工作节点。工作节点约 3.6 GiB 内存，所以监控栈全部
 `nodeSelector` 到 master 并加 control-plane taint 的 toleration，
 总请求 490m CPU / 928Mi 内存。
+
+`demo-api` 也带 control-plane toleration 作为 worker 故障时的兜底，
+但 nodeAffinity 偏好 worker，正常状态下不会占用控制面资源。
 
 ## 当前集群
 

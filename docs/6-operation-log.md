@@ -806,3 +806,228 @@ kubectl -n monitoring exec deploy/prometheus -- \
 
 这与第 9 课"ConfigMap 变更不重启 Grafana"是同一类问题的不同表现：
 一个需要重启进程，一个只需要等文件同步。
+
+## 18. 2026-11-06 10:20–11:20 P6 可用性加固
+
+### 18.1 这一层要解决什么
+
+P5 做完后，HPA 能扩到 5 副本，但这些副本全挤在**同一个 worker 节点**上，
+而且没有任何机制保证：
+
+- 节点维护时不会一次性驱逐所有副本
+- 单个应用不会吃光整个集群的资源
+- 容器收到 SIGTERM 时能把在途请求处理完
+- 资源紧张时关键业务优先保留
+
+这一层把"能跑"变成"能扛"。
+
+### 18.2 五个组件
+
+| 组件 | 配置 | 作用 |
+| --- | --- | --- |
+| `PriorityClass` | `sre-lab-critical`=100000，`sre-lab-batch`=1000 | 资源紧张时关键业务优先保留 |
+| `PodDisruptionBudget` | `minAvailable: 1` | 自愿中断（drain/evict）时至少留 1 个可用 |
+| `ResourceQuota` | request 4 CPU/4Gi，limit 8 CPU/8Gi，pods 20 | 防止单个命名空间吃光集群 |
+| `LimitRange` | default 200m/256Mi，max 2 CPU/2Gi，maxLimitRequestRatio 10 | 给忘记写 resources 的 Pod 兜底，同时封顶 |
+| 优雅终止 | `preStop: sleep 5` + `terminationGracePeriodSeconds: 30` | 等 Endpoint 摘除后再停进程 |
+| `startupProbe` | 2s × 30 = 60s | 启动阶段 liveness 不介入，避免误杀 |
+| 拓扑分布 | `maxSkew: 1`，`ScheduleAnyway` | 副本尽量跨节点；只有 1 个节点时允许不满足 |
+| 调度兜底 | toleration + nodeAffinity 偏好 worker | worker 挂了能去 master |
+
+### 18.3 第一次 drain：PDB 正确，但镜像没预热
+
+第一次 drain 的真实输出：
+
+```text
+evicting pod sre-lab/demo-api-544f976986-s65ld
+error when evicting pods/"demo-api-544f976986-6fcnl" (will retry after 5s):
+  Cannot evict pod as it would violate the pod's disruption budget.
+pod/demo-api-544f976986-s65ld evicted
+...（此后 4 分钟内反复重试全部被拒）
+error: unable to drain node "node": global timeout reached: 4m0s
+```
+
+**PDB 工作得完全正确**：
+
+```text
+驱逐第 1 个前: ALLOWED DISRUPTIONS = 1
+驱逐第 1 个后: ALLOWED DISRUPTIONS = 0   ← 第二个立刻被拦住
+```
+
+同时 toleration + affinity 也生效了——新副本被调度到了 master：
+
+```text
+demo-api-544f976986-d75zs   0/1   ContainerCreating   4m48s   master
+```
+
+**但它卡住了**：
+
+```text
+Events:
+  Normal  Scheduled  4m28s  Successfully assigned sre-lab/demo-api-544f976986-d75zs to master
+  Normal  Pulling    4m28s  kubelet  Pulling image "ghcr.io/0tinna/sre-devops-lab:7f30733..."
+```
+
+**根因**：master 节点本地没有这个镜像，正在从 ghcr.io 拉，而国内网络下拉取极慢。
+
+于是形成死锁：
+- PDB 要等新副本 Ready 才放行第 2 个驱逐
+- 新副本要等镜像拉完才 Ready
+- 镜像拉不完 → drain 永远完不成
+
+### 18.4 关键教训：PDB 的正确性依赖"替身能快速就绪"
+
+这是本层最有价值的发现：
+
+> **PDB 保证的是"可用副本数不低于 minAvailable"，但它不保证这个保证能在可接受的时间内兑现。**
+> 如果新副本要 5 分钟才能起来，那 drain 就会卡 5 分钟——PDB 数值上正确，运维体感是故障。
+
+生产环境的对应做法：
+
+1. **镜像预热**：在所有可能调度的节点上预拉镜像（DaemonSet 或部署流程的一部分）
+2. **本地镜像仓库**：内网 registry / Harbor，避免每次回源
+3. **合理放宽 PDB**：2 副本配 `minAvailable: 1` 已经很紧，可以考虑 `maxUnavailable: 1`
+4. **提前演练 drain**：不要等真维护时才发现拉镜像慢
+
+### 18.5 绕过 ghcr.io 慢速：内网搬运镜像
+
+`crictl pull` 直连 ghcr.io，600 秒超时都没拉完。改用 node → master 内网搬运：
+
+```bash
+# 1) 在已有镜像的 node 上导出
+ssh root@172.31.12.103 "ctr -n k8s.io images export \
+  --platform linux/amd64 /tmp/sre-img.tar ghcr.io/0tinna/sre-devops-lab:7f30733..."
+
+# 2) 走内网传到 master
+scp root@172.31.12.103:/tmp/sre-img.tar /tmp/sre-img.tar
+
+# 3) 在 master 导入
+ctr -n k8s.io images import --platform linux/amd64 /tmp/sre-img.tar
+```
+
+实测耗时：
+
+| 步骤 | 耗时 |
+| --- | --- |
+| node 导出 | 约 5s（45 MB） |
+| node → master scp | 0s（同机房内网） |
+| master 导入 | **17s** |
+| 对比：直接 pull | **>600s 未完成** |
+
+导入后卡住的 Pod 立刻变成 `1/1 Running`。
+
+### 18.6 第二次 drain：7 秒完成
+
+预热后重跑，全程：
+
+```text
+=== 开始 drain node 11:09:56 ===
+node/node cordoned
+pod/demo-api-544f976986-6fcnl evicted
+node/node drained
+drain 完成 11:10:03        ← 7 秒
+```
+
+结果：
+
+```text
+demo-api-544f976986-9x6wm   1/1   Running   7s   10.244.0.25   master
+demo-api-544f976986-d75zs   1/1   Running   28m  10.244.0.23   master
+demo-api   1     N/A   0           ← PDB 阻止进一步驱逐（只有 1 个就绪）
+Endpoints: 10.244.0.23:8080,10.244.0.25:8080
+```
+
+### 18.7 Pod 迁回 node：零失败
+
+drain 会让所有副本跑到 master，恢复后要让它们回到 worker（affinity 偏好）。
+逐个删除验证 PDB 保护下的滚动迁移：
+
+| 操作 | 结果 | 探针计数 |
+| --- | --- | --- |
+| 删除 master 上的 `-9x6wm` | 新 Pod `-hwrll` 调度到 **node** | `ok=39 fail=0` |
+| 删除 master 上的 `-d75zs` | 新 Pod `-ppr6s` 调度到 **node** | `ok=69 fail=0` |
+
+**全程零请求失败**，affinity 偏好也验证了：新 Pod 都回到了 worker 而不是留在 master。
+
+### 18.8 一个调试坑：容器里 echo 的输出看不到
+
+探针 Pod 用 `sh -c 'while ...; do echo ...; done'` 往 stdout 写结果，
+但 `kubectl logs` **一直是空的**，而服务实际被测了上百次。
+
+原因：容器内 sh 的 stdout 是块缓冲的，而进程还在 `sleep`，缓冲区没被刷出来。
+
+**改成写文件就正常了**：
+
+```yaml
+volumeMounts: [{name: probe, mountPath: /probe}]
+# 脚本里
+echo "t=$(date +%H:%M:%S) ok=$ok fail=$fail" > /probe/result.log.cur
+# 查看
+kubectl exec svcprobe -- cat /probe/result.log.cur
+```
+
+**教训**：长驻探针/守护脚本的进度不要依赖 stdout，落盘更可靠。
+
+### 18.9 已知限制（如实记录）
+
+| 限制 | 说明 |
+| --- | --- |
+| PDB 不覆盖非自愿中断 | 节点宕机、内核 panic 时 PDB 无效，只能靠多副本 + 跨节点 |
+| 只有 1 个 worker | 正常状态下所有副本仍在同一节点，真正的跨节点容灾需要至少 2 个 worker |
+| master 参与业务调度 | 是 2 节点实验环境的取舍；生产环境不应让业务上控制面 |
+| 镜像分发热点 | 见 18.4，是故障转移的隐藏瓶颈 |
+
+### 18.10 顺手修掉 recover.sh 的两个 bug
+
+做 P6 演练时发现 `recover.sh` 会把镜像悄悄降级到旧版本：
+
+```text
+目标镜像: ghcr.io/0tinna/sre-devops-lab:cce5412d...
+当前镜像: ghcr.io/0tinna/sre-devops-lab:7f30733...
+→ 恢复后 /simulate/degraded 和 /simulate/cpu 变成 404
+```
+
+**Bug 1：`IMAGE_SHA` 被硬编码成某个历史 sha**
+
+```bash
+# 修改前
+IMAGE_SHA="${IMAGE_SHA:-cce5412d9f4a5c5d83832cd95d5ff67919c1d7c2}"
+```
+
+后果：每次"恢复到基线"都回到那个旧版本，后加的端点反而消失。
+改成从 git HEAD 推导，并打印目标/当前对比：
+
+```bash
+GIT_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
+IMAGE_SHA="${IMAGE_SHA:-$GIT_SHA}"
+# 并显式提示：若 tag 未构建完，rollout 会卡在 ImagePullBackOff
+```
+
+**Bug 2：`recover.sh | head -8` 让脚本被 SIGPIPE 杀死**
+
+调试时用 `./scripts/drills/recover.sh 2>&1 | head -8` 只看开头，
+结果脚本在打印完头部就被 SIGPIPE 终止，**后面的 `sed` 和 `kubectl apply` 根本没执行**，
+但终端显示"rollout successfully"（因为什么都没改，当前状态本来就行）。
+
+```bash
+# 错误写法：只看到前 8 行就截断管道
+./scripts/drills/recover.sh | head -8
+
+# 正确写法：先落盘再看
+./scripts/drills/recover.sh > /tmp/recover.log 2>&1
+tail -20 /tmp/recover.log
+```
+
+这和第 9 课"管道吞掉退出码"是同一类问题：**管道会让生产端提前死亡，
+但你看到的退出码/输出都是下游的**。
+
+### 18.11 验证数据汇总
+
+| 项 | 数值 |
+| --- | --- |
+| drain 耗时（预热后） | 7 秒 |
+| drain 耗时（未预热） | 超时 4 分钟，失败 |
+| 服务请求失败数 | 0（迁移全程 69 次探测全成功） |
+| master 镜像导入 | 45 MB / 17 秒 |
+| 直接 pull 对比 | >600 秒未完成 |
+| PDB 阻断驱逐次数 | 第一次 drain 中 16+ 次 |

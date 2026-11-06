@@ -27,16 +27,18 @@ declare -A SCENARIOS=(
   [8]="Service 的 selector 与服务端标签不匹配"
   [9]="日志里持续出现 ERROR，但指标全绿"
   [10]="日志采集静默中断，服务与指标都正常"
+  [11]="PDB 设成与副本数相等，节点维护被永久阻塞"
 )
 
 list_scenarios() {
   echo "可用场景："
-  for i in $(seq 1 10); do
+  for i in $(seq 1 11); do
     echo "  $i) ${SCENARIOS[$i]}"
   done
   echo
   echo "  1-8  面向指标与状态：Pod 状态、探针、调度、配置"
   echo "  9-10 面向日志：日志与指标不一致、采集链路断裂"
+  echo "  11   面向可用性：维护操作被 PDB 阻塞"
   echo
   echo "注入后建议流程："
   echo "  1. ./scripts/drills/collect.sh <编号>   采集现场证据（含 Loki 日志）"
@@ -171,6 +173,25 @@ EOF
       -p='{"spec":{"template":{"spec":{"nodeSelector":{"drill-disabled":"true"}}}}}'
     echo "已注入。日志采集器将从两个节点消失。"
     echo "关注点：服务是否受影响，Loki 里还能不能查到新日志。"
+    ;;
+
+  11)
+    # 把 PDB 的 minAvailable 设成与副本数相等：ALLOWED DISRUPTIONS 变 0，
+    # 任何自愿驱逐（drain / evict）都会被永久拒绝。
+    # 注意：这不会影响正在运行的服务，只影响"能否被正常维护"。
+    kubectl -n "$NS" patch pdb demo-api --type=merge \
+      -p='{"spec":{"minAvailable":2}}'
+    echo "已注入。PDB minAvailable=2，与副本数相等。"
+    echo
+    echo "观察点："
+    echo "  kubectl -n $NS get pdb demo-api        # ALLOWED DISRUPTIONS 应为 0"
+    echo "  kubectl -n $NS describe pdb demo-api   # 看 Status 里的期望/当前健康数"
+    echo
+    echo "警告：不要用 kubectl drain --dry-run=server 验证——"
+    echo "      --dry-run=server 仍会调用驱逐 API，会真的卡住。"
+    echo "      只读验证请看 AllOWED DISRUPTIONS，或用 --dry-run=client。"
+    echo
+    echo "注意：服务本身完全正常，只是节点再也无法安全下线。"
     ;;
 
   *)

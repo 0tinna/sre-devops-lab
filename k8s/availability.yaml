@@ -1,0 +1,86 @@
+# 命名空间级可用性与资源治理。
+#
+# 这一层解决的是"HPA 能扩，但扩了也没用"的问题：
+#   - 没有 PDB，节点维护时会把所有副本一次性驱逐
+#   - 没有 ResourceQuota，单个应用能吃光整个集群
+#   - 没有 LimitRange，忘记写 resources 的 Pod 会拿到 unbounded 配额
+#   - 没有 PriorityClass，资源紧张时关键业务和被驱逐的优先级一样
+
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: sre-lab-critical
+value: 100000
+globalDefault: false
+description: 'SRE lab 关键业务：节点压力时优先保留，不被低优先级 Pod 抢占'
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: sre-lab-batch
+value: 1000
+globalDefault: false
+description: 'SRE lab 批处理与临时任务：可被关键业务抢占'
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: demo-api
+  namespace: sre-lab
+  labels:
+    app.kubernetes.io/name: demo-api
+    app.kubernetes.io/part-of: sre-devops-lab
+spec:
+  # 至少保留 1 个可用副本。2 副本时意味着最多 1 个能被自愿驱逐。
+  # 注意：PDB 只对"自愿中断"生效（drain、evict、rollout 的驱逐），
+  # 节点直接宕机属于非自愿中断，PDB 管不了。
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-api
+  unhealthyPodEvictionPolicy: AlwaysAllow
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: sre-lab-quota
+  namespace: sre-lab
+spec:
+  hard:
+    # 按 HPA 上限估算：5 副本 × (100m CPU / 128Mi) = 500m / 640Mi，
+    # 留出 8 倍余量给压测和临时任务
+    requests.cpu: '4'
+    requests.memory: 4Gi
+    limits.cpu: '8'
+    limits.memory: 8Gi
+    pods: '20'
+    services: '10'
+    configmaps: '20'
+    secrets: '20'
+    persistentvolumeclaims: '5'
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: sre-lab-limits
+  namespace: sre-lab
+spec:
+  limits:
+    - type: Container
+      # 没写 resources 的容器自动获得这组默认值
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      # 单个容器的硬上限，防止有人写 cpu: 100
+      max:
+        cpu: '2'
+        memory: 2Gi
+      min:
+        cpu: 10m
+        memory: 16Mi
+      # limit/request 比值上限，避免 request 写得极小来刷调度
+      maxLimitRequestRatio:
+        cpu: '10'

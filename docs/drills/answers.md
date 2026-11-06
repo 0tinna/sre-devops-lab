@@ -643,6 +643,126 @@ SOP 第 6 课「指标正确性」+ 附录 D。
 
 ---
 
+## S11 · PDB 阻塞节点维护
+
+### 根因
+
+`PodDisruptionBudget` 的 `minAvailable` 被改成了 `2`，与副本数相等。
+这意味着"任何时刻都必须有 2 个可用副本"，而总共只有 2 个——
+所以**任何自愿驱逐都会被拒绝**，`ALLOWED DISRUPTIONS` 恒为 0。
+
+### 判据链
+
+```text
+① summary.txt → 一切正常
+   demo-api 2/2 Running，无重启，无 Events 异常
+   指标正常，告警 0 条
+
+② 执行维护动作才暴露问题
+   kubectl drain node --ignore-daemonsets --delete-emptydir-data
+   → error when evicting pods/"demo-api-xxx":
+     Cannot evict pod as it would violate the pod's disruption budget.
+
+③ 看 PDB 本身
+   kubectl -n sre-lab get pdb demo-api
+   NAME       MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS
+   demo-api   2               N/A               0        ← 关键
+   
+   ALLOWED DISRUPTIONS = 0 表示"一个都不许动"
+
+④ 对比副本数
+   kubectl -n sre-lab get deploy demo-api → replicas: 2
+   minAvailable(2) == replicas(2) → 死锁
+```
+
+### 关键概念：PDB 保护的是"可维护性"，不是"可用性"
+
+这是最容易搞反的一点：
+
+| 你以为 | 实际 |
+| --- | --- |
+| PDB 让服务更可用 | PDB 限制**你能做多少破坏性操作** |
+| minAvailable 越大越安全 | minAvailable 越大越难维护，等于 副本数时完全不能维护 |
+| 没有 PDB 就危险 | 没有 PDB 可以随意驱逐，但也没有保护 |
+
+**PDB 是一把刹车，不是发动机。** 它不产生可用性，只约束中断。
+
+### `ALLOWED DISRUPTIONS` 的含义
+
+```text
+ALLOWED DISRUPTIONS = (当前健康副本数) - minAvailable
+
+2 副本 + minAvailable 1 → 允许 1 个被驱逐
+2 副本 + minAvailable 2 → 允许 0 个，永远卡住
+3 副本 + minAvailable 2 → 允许 1 个
+```
+
+### 常见误判
+
+| 误判 | 为什么错 |
+| --- | --- |
+| "服务是好的，所以没问题" | 服务好≠可维护。这次故障只有在你做维护时才暴露 |
+| "PDB 设严一点更安全" | 设成等于副本数就等于禁止一切维护，包括紧急修复 |
+| "删掉 PDB 就好了" | 删掉后 drain 能过，但也失去了滚动发布时的保护 |
+| "等业务低峰再维护" | 低峰也是同样的 PDB 约束，跟时间无关 |
+
+### 修复
+
+```bash
+# 把 minAvailable 调回 1（2 副本时允许 1 个被驱逐）
+kubectl -n sre-lab patch pdb demo-api --type=merge \
+  -p='{"spec":{"minAvailable":1}}'
+# 或直接 apply 正确清单
+kubectl apply -f k8s/availability.yaml
+# 或 ./scripts/drills/recover.sh
+```
+
+### 预防：正确选型
+
+| 副本数 | 推荐配置 | 理由 |
+| --- | --- | --- |
+| 2 | `minAvailable: 1` | 允许 1 个被驱逐，滚动维护可行 |
+| 2 | `maxUnavailable: 1` | 语义等价，但意图更清楚 |
+| 3+ | `minAvailable: 2` | 容忍 1 个故障，同时保留冗余 |
+| 1 | 不建议设 PDB | 设了就无法维护，等于自锁 |
+
+**经验法则**：`minAvailable` 必须**严格小于**副本数，否则等于禁止维护。
+
+### 怎么提前发现
+
+这类问题不会自己报警，只能主动检查：
+
+```promql
+# PDB 的 allowed disruptions 为 0 超过一段时间 = 维护能力已丧失
+kube_poddisruptionbudget_status_expected_pods{namespace="sre-lab"}
+  - kube_poddisruptionbudget_status_current_healthy{namespace="sre-lab"}
+  <= 0
+```
+
+建议加成告警（本项目尚未实现）：
+
+```yaml
+- alert: PDBBlocksMaintenance
+  expr: |
+    kube_poddisruptionbudget_status_desired_healthy{namespace="sre-lab"}
+      - kube_poddisruptionbudget_status_current_healthy{namespace="sre-lab"} <= 0
+  for: 30m
+  labels:
+    severity: warning
+  annotations:
+    summary: 'PDB {{ $labels.poddisruptionbudget }} 不允许任何中断'
+    description: 'ALLOWED DISRUPTIONS 为 0，节点维护与滚动升级都会被阻塞。'
+```
+
+### 对应课
+
+SOP 附录 E「可用性配置的正确失败」。
+
+**核心教训**：**一个只影响"未来操作"的配置错误，不会体现在任何实时指标上**。
+它安静地躺着，直到你真正需要维护的那一天。
+
+---
+
 ## 判据速查表
 
 | 现象 | 最先查 | 关键判据 |
@@ -657,6 +777,8 @@ SOP 第 6 课「指标正确性」+ 附录 D。
 | **指标全绿但日志有 ERROR** | `logs-loki.txt` 的 ERROR 行数 | 错误被应用吞掉，状态码仍是 200 |
 | **日志查不到** | 采集时间 vs 最新日志时间戳 | 差值 > 几分钟 = 管道断了 |
 | **采集器是否存在** | `get pods -l app.kubernetes.io/name=fluent-bit` | 空 = 被驱逐或配置错误 |
+| **drain/evict 被拒** | `get pdb` 的 ALLOWED DISRUPTIONS | 0 = minAvailable 设得太严 |
+| **维护操作卡住** | `describe pod` 的 Events | `Pulling image` = 镜像分发热点 |
 
 ## 通用原则
 
