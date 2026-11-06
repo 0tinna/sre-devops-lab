@@ -181,7 +181,11 @@ spec:
           args:
             - '--port=8080'
             - '--telemetry-port=8081'
-            - '--resources=pods,deployments,replicasets,statefulsets,daemonsets,nodes,namespaces,services,endpoints,persistentvolumes,persistentvolumeclaims,jobs,cronjobs'
+            # 注意：--resources 是白名单，不在列表里的资源完全不会产生指标。
+            # 这里必须包含 horizontalpodautoscalers 和 poddisruptionbudgets，
+            # 否则依赖它们的告警表达式（HPAMaxedOut / HPAUnableToScale / PDBBlocksMaintenance）
+            # 会静默失效——指标不存在，告警永远不会触发，但规则看起来完全正常。
+            - '--resources=pods,deployments,replicasets,statefulsets,daemonsets,nodes,namespaces,services,endpoints,persistentvolumes,persistentvolumeclaims,jobs,cronjobs,horizontalpodautoscalers,poddisruptionbudgets'
           ports:
             - name: http-metrics
               containerPort: 8080

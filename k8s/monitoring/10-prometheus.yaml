@@ -72,6 +72,57 @@ data:
       - job_name: kube-state-metrics
         static_configs:
           - targets: ['kube-state-metrics.monitoring.svc.cluster.local:8080']
+
+      # Loki 自身指标。
+      # 不采这个，LokiNotReceivingLogs 告警引用的
+      # loki_distributor_lines_received_total 就永远不存在 —— 死告警。
+      - job_name: loki
+        static_configs:
+          - targets: ['loki.monitoring.svc.cluster.local:3100']
+
+      # cAdvisor：容器级 CPU/内存。
+      # 走 apiserver 代理（/api/v1/nodes/<node>/proxy/...），
+      # 这样不需要直连 kubelet 的 10250 端口，也不需要额外证书配置，
+      # 只需要 ServiceAccount 有 nodes/proxy 权限（RBAC 里已有）。
+      - job_name: kubelet-cadvisor
+        scheme: https
+        kubernetes_sd_configs:
+          - role: node
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          insecure_skip_verify: true
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: '__address__'
+            replacement: 'kubernetes.default.svc:443'
+          - source_labels: ['__meta_kubernetes_node_name']
+            regex: '(.+)'
+            target_label: '__metrics_path__'
+            replacement: '/api/v1/nodes/${1}/proxy/metrics/cadvisor'
+          - source_labels: ['__meta_kubernetes_node_name']
+            target_label: node
+
+      # kubelet 自身指标，含 kubelet_image_pull_duration_seconds，
+      # 用于观察镜像拉取耗时（镜像分发热点，见 docs/6-operation-log.md 18.4）。
+      - job_name: kubelet
+        scheme: https
+        kubernetes_sd_configs:
+          - role: node
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          insecure_skip_verify: true
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: '__address__'
+            replacement: 'kubernetes.default.svc:443'
+          - source_labels: ['__meta_kubernetes_node_name']
+            regex: '(.+)'
+            target_label: '__metrics_path__'
+            replacement: '/api/v1/nodes/${1}/proxy/metrics'
+          - source_labels: ['__meta_kubernetes_node_name']
+            target_label: node
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -115,6 +166,22 @@ data:
             annotations:
               summary: 'Pod {{ $labels.namespace }}/{{ $labels.pod }} 状态异常'
               description: 'Pod 已处于 {{ $labels.phase }} 超过 2 分钟。'
+
+          # PDB 的 allowed disruptions 为 0：可用性没问题，但维护能力已经丧失。
+          # 这类故障不影响任何实时指标，只有真去 drain/升级时才暴露
+          # （演练场景 11，见 docs/drills/answers.md 的 S11）。
+          # 依赖 kube_poddisruptionbudget_status_pod_disruptions_allowed，
+          # 该指标只有在 kube-state-metrics 的 --resources 里包含
+          # poddisruptionbudgets 时才存在，否则本告警是死的。
+          - alert: PDBBlocksMaintenance
+            expr: |
+              kube_poddisruptionbudget_status_pod_disruptions_allowed{namespace="sre-lab"} <= 0
+            for: 30m
+            labels:
+              severity: warning
+            annotations:
+              summary: 'PDB {{ $labels.poddisruptionbudget }} 不允许任何中断'
+              description: 'minAvailable 可能被设成等于副本数，节点维护与滚动升级都会被永久阻塞。'
 
       - name: reliability
         rules:
@@ -161,6 +228,9 @@ data:
               description: '15 分钟内重启次数超过 3 次，检查容器退出原因与 OOM。'
 
           # 容器 OOM 被杀
+          # 注意：kube_pod_container_status_last_terminated_reason 只在容器
+          # **曾经终止过** 时才存在。当前没有容器重启时这条指标为空，
+          # 告警不触发是正确的，不要误判为"指标缺失"。
           - alert: ContainerOOMKilled
             expr: |
               kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
@@ -171,8 +241,52 @@ data:
               summary: '容器 {{ $labels.container }} 曾因 OOM 被杀'
               description: '内存 limit 可能过小，或应用存在内存泄漏。'
 
+          # 镜像拉取失败：Tag 写错、仓库不可达、认证失败。
+          # 演练场景 5 就靠这条。同理，waiting_reason 指标只在
+          # 容器真的处于等待状态时才出现。
+          - alert: PodImagePullFailed
+            expr: |
+              kube_pod_container_status_waiting_reason{
+                reason=~"ErrImagePull|ImagePullBackOff|InvalidImageName"
+              } > 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: 'Pod {{ $labels.namespace }}/{{ $labels.pod }} 镜像拉取失败'
+              description: '原因 {{ $labels.reason }}。检查镜像 tag 是否存在、仓库是否可达。'
+
+          # cgroup 级别的 OOM 事件。
+          # 比 ContainerOOMKilled 更可靠：后者依赖容器重启，
+          # 而 gunicorn 这类多 worker 应用里，OOM 只杀掉一个 worker，
+          # master 会立刻补位，容器根本不重启 —— 那条告警抓不到。
+          - alert: ContainerOOMEvents
+            expr: |
+              increase(container_oom_events_total{namespace="sre-lab"}[5m]) > 0
+            labels:
+              severity: critical
+            annotations:
+              summary: '容器 {{ $labels.pod }}/{{ $labels.container }} 发生 OOM'
+              description: 'cgroup 内存超限触发了 OOM killer，即使容器没重启也要处理。'
+
       - name: capacity
         rules:
+          # 镜像拉取耗时：kubelet 的 histogram，反映"调度到新节点时的启动延迟"。
+          # 镜像没预热时这一步会吃掉几分钟，把故障转移时间放大数倍
+          # （实测 drain 从 7s 变成 4min 超时，见 docs/6-operation-log.md 18.4）。
+          - alert: ImagePullSlow
+            expr: |
+              histogram_quantile(
+                0.9,
+                sum by (node, le) (rate(kubelet_image_pull_duration_seconds_bucket[30m]))
+              ) > 120
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: '节点 {{ $labels.node }} 镜像拉取 P90 超过 120 秒'
+              description: '考虑预热镜像或使用内网 registry：./scripts/prewarm-image.sh'
+
           # 节点内存压力
           - alert: NodeMemoryPressure
             expr: |

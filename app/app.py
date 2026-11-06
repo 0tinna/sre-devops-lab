@@ -115,15 +115,22 @@ def simulate_memory():
 
     默认关闭：只有显式设置 ENABLE_FAULT_ENDPOINTS=1 才可用，避免误触发生产式故障。
     参数：mib=每次分配总量，hold=保持秒数。
+
+    注意：必须用 bytearray(...) 逐个创建独立对象。
+    早期版本写成 `[block for _ in range(mib)]`，那是对同一个 1MiB bytes
+    对象的 mib 个引用——实际只占 1MiB，不管传多少都不会触发 OOM。
     """
     if not FAULT_ENDPOINTS_ENABLED:
         return _fault_disabled()
-    mib = int(request.args.get('mib', '64'))
-    hold = int(request.args.get('hold', '30'))
-    block = b'x' * (1024 * 1024)
-    chunks = [block for _ in range(max(mib, 0))]
-    time.sleep(max(hold, 0))
-    return jsonify(allocated_mib=len(chunks), held_seconds=max(hold, 0))
+    mib = max(0, min(int(request.args.get('mib', '64')), 2048))
+    hold = max(0, min(int(request.args.get('hold', '30')), 300))
+    # 每个 bytearray 是独立的 1MiB，total = mib MiB
+    chunks = [bytearray(1024 * 1024) for _ in range(mib)]
+    # 写入数据，防止被优化掉/懒分配
+    for buf in chunks:
+        buf[0] = 1
+    time.sleep(hold)
+    return jsonify(allocated_mib=len(chunks), held_seconds=hold)
 
 
 @app.get('/simulate/degraded')
