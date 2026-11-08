@@ -615,8 +615,13 @@ kube_daemonset_status_number_ready{daemonset="fluent-bit"}
 sum(rate({namespace="sre-lab"}[5m])) == 0
 ```
 
-本项目的告警规则里**还没有这两条**，这是一个已知缺口，
-建议加到 `k8s/monitoring/10-prometheus.yaml` 的容量组：
+本项目已经有两条对应的告警（P7 阶段补齐）：
+
+- `LogCollectorDown`：Fluent Bit DaemonSet 就绪数 < 期望数（5m，critical）
+- `LokiNotReceivingLogs`：Loki 15m 内无日志写入（15m，warning）
+
+两条都在 `k8s/monitoring/10-prometheus.yaml` 的 capacity 组。
+如果想更细粒度地按命名空间检测，可以另加一条基于 Loki LogQL 的规则：
 
 ```yaml
 - alert: LogPipelineStalled

@@ -255,7 +255,7 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000       # 默认 admin / 
 
 本项目把自动执行和人工操作分开记录。详细时间线见 `docs/6-operation-log.md`。
 
-- `[x]` 表示已经由 Codex 执行。
+- `[x]` 表示已经由 AI 助手（Codex / DSH）执行。
 - `[ ]` 表示等待用户或后续阶段执行。
 - `只读` 表示只查询，不改变集群状态。
 - `写操作` 表示会修改本地文件、Git 仓库或集群。

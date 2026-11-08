@@ -199,7 +199,7 @@ rate(/readyz[2m])：0.400/s                            （探针 5s × 2 Pod，�
 
 ```text
 target     7 → 12（补 cAdvisor、kubelet、loki）
-指标       744 → 1348
+指标       744 → 1344
 死告警     3 → 0
 ```
 

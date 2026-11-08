@@ -8,7 +8,9 @@ master 工作目录：`/opt/sre-devops-lab`
 
 私钥只保留在 master 节点。下面的公钥可以安全地粘贴到 GitHub。
 
-## 当前执行进度
+## 初始设置进度（历史记录）
+
+> 以下是项目首次推送时的执行记录，保留作为审计留痕。当前状态见 [`8-handoff.md`](8-handoff.md)。
 
 | 步骤 | 状态 | 执行者 | 说明 |
 | --- | --- | --- | --- |
@@ -24,7 +26,7 @@ master 工作目录：`/opt/sre-devops-lab`
 | Kubernetes 部署 | [x] | 用户 | Deployment 已创建 |
 | 镜像数字 UID 修复 | [x] | Codex | 提交 `652760f`，Actions 构建成功 |
 | 修复后验证 | [x] | Codex | 2/2 Running，healthz 和 readyz 返回 200 |
-| Prometheus / Grafana | [ ] | Codex | 后续阶段 |
+| Prometheus / Grafana | [x] | DSH | P1–P7 全部完成，详见 `8-handoff.md` |
 
 ## 1. 添加具有写权限的部署密钥
 

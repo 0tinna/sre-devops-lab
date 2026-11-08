@@ -54,12 +54,15 @@
 
 ## 1. 已落地的产物（当时快照：2026-11-05，尚未 apply）
 
+> **⚠ 本节数字是 P1 初始规划时的快照。** 后来 P4–P7 把 job 数从 4 扩到 12、
+> 告警从 10 扩到 20、监控文件增加了 `50-grafana-dashboard.yaml`/`60-loki.yaml`/`75-fluent-bit.yaml`。
+
 清单目录 `k8s/monitoring/`，21 个对象已通过 `kubectl apply --dry-run=client` 校验：
 
 | 文件 | 内容 |
 | --- | --- |
 | `00-namespace-rbac.yaml` | namespace `monitoring`、Prometheus 的 SA / ClusterRole（node、pod、endpoint、`/metrics`）/ 绑定 |
-| `10-prometheus.yaml` | Prometheus 配置（4 个 job：self、alertmanager、demo-api 注解发现、node-exporter 节点发现、kube-state-metrics）、**10 条告警规则**、Deployment、Service |
+| `10-prometheus.yaml` | Prometheus 配置（初始 4 个 job，后扩至 12）、**初始 10 条告警规则（后扩至 20）**、Deployment、Service |
 | `20-alertmanager.yaml` | 路由（critical 快通道）、抑制规则、Deployment、Service |
 | `30-exporters.yaml` | node-exporter DaemonSet（hostNetwork:9100，覆盖 master 的 taint）、kube-state-metrics 全套 RBAC + Deployment + Service |
 | `40-grafana.yaml` | 管理员 Secret、Prometheus 数据源 provisioning、Deployment、Service |
