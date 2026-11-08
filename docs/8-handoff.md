@@ -4,11 +4,11 @@
 带日期的文件名注定过期，而"当前状态"永远需要一个固定的入口。
 
 - 最后更新：2026-11-08
-- 当前 HEAD：`eb00fbf`
+- 当前 HEAD：`529b6ff`（配置与演练基准 commit：`eb00fbf`）
 - 部署镜像：`ghcr.io/0tinna/sre-devops-lab:6d9cc233abf39c0b9cdc31b0e3e8c2d813fda54e`
 
-> **镜像 tag 不必等于 HEAD。** `eb00fbf` 只改了监控配置和文档，没有触发重新部署，
-> 所以集群里跑的是上一个带应用代码变更的提交构建的镜像。判断"当前跑的是什么"，
+> **镜像 tag 不必等于 HEAD。** `eb00fbf` 之后的提交均为文档优化与归档，未改动应用代码，
+> 所以未触发新镜像构建，集群中稳定运行的是经充分验证的 `6d9cc23` 镜像。判断"当前跑的是什么"，
 > 永远查 `kubectl -n sre-lab get deploy demo-api -o jsonpath='{...image}'`，不要看 git log。
 
 ## 一、环境
