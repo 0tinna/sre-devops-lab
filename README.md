@@ -11,7 +11,9 @@
 ## 项目内容
 
 - Flask 示例 API，提供 `/healthz`、`/readyz`、`/metrics`、`/api/orders`
-- 受控故障接口：`/simulate/error`、`/simulate/slow`、`/simulate/memory`（默认关闭，`ENABLE_FAULT_ENDPOINTS=1` 开启）
+- 受控故障接口：`/simulate/error`、`/simulate/slow`、`/simulate/memory`、
+  `/simulate/degraded`（200 但日志有 ERROR）、`/simulate/cpu`（触发 HPA）
+  ——默认关闭，`ENABLE_FAULT_ENDPOINTS=1` 开启
 - gunicorn 多 worker + `prometheus_client` multiprocess 模式，避免计数器在 worker 间抖动
 - 多阶段 Dockerfile，容器以非 root 用户运行
 - Kubernetes Deployment 与 Service，包含探针、资源限制和安全上下文
@@ -28,20 +30,20 @@
 
 ## 文档
 
-**文件名前面的数字就是学习顺序**，按 1 → 9 读即可。完整索引见 [`docs/README.md`](docs/README.md)。
+**文件名前面的数字就是学习顺序**，按 1 → 10 读即可。完整索引见 [`docs/README.md`](docs/README.md)。
 
 | 编号 | 文档 | 内容 |
 | --- | --- | --- |
 | 1 | [`1-manual-from-zero-to-one.md`](docs/1-manual-from-zero-to-one.md) | 从 0 到 1 实践手册：这个项目怎么搭起来的 |
-| 2 | [`2-troubleshooting-sop.md`](docs/2-troubleshooting-sop.md) | **9 节课的故障排查 SOP**，真实问题提炼，每课含自检题 |
-| 3 | [`3-monitoring-runbook.md`](docs/3-monitoring-runbook.md) | 监控访问、10 条告警清单、D1–D8 演练步骤 |
-| 4 | [`4-next-phase-plan.md`](docs/4-next-phase-plan.md) | 下一阶段计划、实测证据与完成情况 |
+| 2 | [`2-troubleshooting-sop.md`](docs/2-troubleshooting-sop.md) | **9 节课 + 5 个附录的故障排查 SOP**，真实问题提炼，每课含自检题 |
+| 3 | [`3-monitoring-runbook.md`](docs/3-monitoring-runbook.md) | 监控访问、20 条告警清单、抓取拓扑 |
+| 4 | [`4-next-phase-plan.md`](docs/4-next-phase-plan.md) | 阶段规划与完成情况（P1–P7）、剩余待办 |
 | 5 | [`5-cluster-inventory.md`](docs/5-cluster-inventory.md) | 硬件、网络、已装组件的事实基线 |
-| 6 | [`6-operation-log.md`](docs/6-operation-log.md) | 每个动作的时间线与执行者 |
+| 6 | [`6-operation-log.md`](docs/6-operation-log.md) | 每个动作的时间线、证据与踩坑记录 |
 | 7 | [`7-github-push-sop.md`](docs/7-github-push-sop.md) | GitHub 部署密钥与推送 SOP |
-| 8 | [`8-handoff-2026-11-05.md`](docs/8-handoff-2026-11-05.md) | 项目交接摘要：当前状态与待办 |
+| 8 | [`8-handoff.md`](docs/8-handoff.md) | **项目交接摘要：当前状态、阶段成果、待办** |
 | 9 | [`9-interview-pitch.md`](docs/9-interview-pitch.md) | 面试表述与追问应对：30 秒版、可深讲的故事 |
-| 10 | [`10-drill-lab.md`](docs/10-drill-lab.md) | **故障演练实验室**：8 个可注入场景，采集证据自己排查 |
+| 10 | [`10-drill-lab.md`](docs/10-drill-lab.md) | **故障演练实验室**：11 个可注入场景，采集证据自己排查 |
 
 只想知道"现在什么状态"，读 8；想学排查方法，读 2；想准备面试，读 9；
 **想动手练，直接跑 `./scripts/drills/inject.sh list`**。
@@ -49,8 +51,8 @@
 ## 架构
 
 ```text
-GitHub Actions                      monitoring 命名空间（全部固定在 master）
-    |                                 +-- Prometheus（抓取 7 个 target，16 条告警）
+GitHub Actions                      monitoring 命名空间（固定在 master）
+    |                                 +-- Prometheus（12 个 target，20 条告警）
     | 构建并推送                      +-- Alertmanager
     v                                 +-- Grafana（Prometheus + Loki 双数据源，15 面板）
 GHCR 镜像                             +-- node-exporter（DaemonSet，hostPort 9100）
@@ -70,6 +72,10 @@ kube-system
     +-- metrics-server v0.8.0         <-- kubectl top / HPA 的数据来源
 ```
 
+`kubelet` 与 `kubelet-cadvisor` 两组抓取走 apiserver 代理
+（`/api/v1/nodes/<node>/proxy/metrics[...]`），替代直连 kubelet 10250，
+不需要额外证书配置，只需 ServiceAccount 有 `nodes/proxy` 权限。
+
 实验集群为 1 个控制面节点 + 1 个工作节点。工作节点约 3.6 GiB 内存，所以监控栈全部
 `nodeSelector` 到 master 并加 control-plane taint 的 toleration，
 总请求 490m CPU / 928Mi 内存。
@@ -82,10 +88,19 @@ kube-system
 - master：172.31.6.211，控制面节点，4 vCPU / 15 GiB / 178 GiB
 - node：172.31.12.103，工作节点，2 vCPU / 3.6 GiB / 50 GiB
 - Kubernetes：v1.34.1
-- 网络：Docker Hub 不可达，quay.io blob 超时，GHCR 可达，`docker.m.daocloud.io` 与 `k8s.m.daocloud.io` 可用
-- `demo-api` Deployment 2/2 Running，镜像 `ghcr.io/0tinna/sre-devops-lab:652760f...`
-- `monitoring` 命名空间已部署（Prometheus / Alertmanager / Grafana / node-exporter / kube-state-metrics），7 个 target 全部 up
-- 存储：没有 StorageClass，Prometheus 与 Grafana 使用 emptyDir，历史数据不持久
+- 网络：Docker Hub 不可达，quay.io blob 超时，GHCR 可达，
+  `docker.m.daocloud.io`（Docker Hub 代理）与 `k8s.m.daocloud.io`（registry.k8s.io 代理）可用
+- `demo-api` Deployment 2/2 Running，HPA 2-5 副本，PDB `minAvailable: 1`
+- `monitoring` 命名空间 9 个 Pod 全部 Running，**12 个 target 全 up，20 条告警规则**
+- `kube-system` 有 metrics-server v0.8.0，`kubectl top` 可用
+- 存储：没有 StorageClass，Prometheus 保留 6h/1GB，Loki 保留 24h，均为 emptyDir，Pod 重建即丢
+
+当前部署的镜像 tag 不必等于 git HEAD——只有带应用代码变更的提交才会触发重新部署。
+判断实际运行版本请查：
+
+```bash
+kubectl -n sre-lab get deploy demo-api -o jsonpath='{.spec.template.spec.containers[0].image}'
+```
 
 ## 快速开始
 
@@ -187,21 +202,27 @@ kubectl -n sre-lab delete pod <pod-name>
 kubectl -n sre-lab get pods -w
 ```
 
-## 下一阶段
+## 已完成与剩余
 
-详细拆分、验收标准与实测证据见 `docs/4-next-phase-plan.md`。
+七个阶段全部完成，详见 [`docs/4-next-phase-plan.md`](docs/4-next-phase-plan.md) 与
+[`docs/6-operation-log.md`](docs/6-operation-log.md) 第 10–19 节：
 
-监控清单已落在 `k8s/monitoring/`（未 apply），包含 Prometheus、Alertmanager、node-exporter、kube-state-metrics、Grafana，以及 10 条告警规则：
+| 阶段 | 内容 |
+| --- | --- |
+| P1 | 监控闭环：10 类告警，全部真实触发验证 |
+| P2 | 故障演练：7 类故障全量执行，每项留 RCA |
+| P3 | 交付与自动化：CD 走 SSH 经跳板机 |
+| P4 | 日志集中化：Loki + Fluent Bit（Promtail 在 K8s 1.34 失效） |
+| P5 | 自动扩缩容：metrics-server + HPA，实测 30 秒 2→4 |
+| P6 | 可用性加固：PDB / 配额 / 优先级 / 优雅终止 |
+| P7 | 死告警审计：找出并修复 3 条永不触发的告警 |
 
-- 监控目标不可用
-- 5xx 比例过高
-- P95 延迟过高
-- Pod 重启过于频繁
-- Deployment 可用副本不足
-- 容器 OOM 被杀
-- 节点内存、磁盘、CPU 压力
+**剩余项**：配 GitHub Secrets 启用 CD、Ingress 对外暴露、容量类告警验证、
+把审计与镜像预热接进 CI。完整清单见 [`docs/8-handoff.md`](docs/8-handoff.md) §四。
 
-在告警真正触发并被处理之前，不要把它称为完整的监控体系。
+> 在告警真正触发并被处理之前，不要把它称为完整的监控体系。
+> 本项目 20 条规则中 **8 条经真实触发验证、12 条如实标注为未验证**，
+> 逐条状态见 [`docs/3-monitoring-runbook.md`](docs/3-monitoring-runbook.md) 的「告警验证状态」表。
 
 ## 监控清单
 
@@ -215,7 +236,9 @@ kubectl -n monitoring port-forward svc/grafana 3000:3000       # 默认 admin / 
 
 调度约束：监控组件全部固定在 master（`nodeSelector: kubernetes.io/hostname=master` 加 control-plane taint 的 toleration），因为工作节点只有 3.6 GiB；Prometheus 用 emptyDir，`retention.time=6h`，集群没有 StorageClass。
 
-镜像源：Docker Hub 与 quay.io 在本环境不可靠，Prometheus/Grafana 走 `docker.m.daocloud.io` 代理，kube-state-metrics 走 `registry.k8s.io`。
+镜像源：Docker Hub 与 quay.io 在本环境不可靠，Prometheus/Grafana/Loki 走
+`docker.m.daocloud.io` 代理，kube-state-metrics 与 metrics-server 走 `k8s.m.daocloud.io`。
+`registry.k8s.io` 会 307 到 `europe-west3-docker.pkg.dev`，该域名在本环境 DNS 解析失败。
 
 ## 面试表达
 

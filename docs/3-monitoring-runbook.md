@@ -81,42 +81,93 @@ Promtail 的 `kubernetes_sd_configs` 在 K8s v1.34.1 上静默失效（0 targets
 **排除的噪声**：`kube-system` 与 `kube-flannel` 的日志不采集（`Exclude_Path`），
 它们是纯噪声，而且量很大。
 
-## 二、抓取拓扑
+## 二、抓取拓扑（12 个目标）
 
-| job | 发现方式 | 说明 |
-| --- | --- | --- |
-| `prometheus` | static | 自身 |
-| `alertmanager` | static | 走 Service DNS |
-| `demo-api` | `kubernetes_sd_configs: pod` + 注解 | 依赖 `prometheus.io/scrape=true`、`prometheus.io/port=8080`、`prometheus.io/path=/metrics`，注解在 `k8s/app.yaml` 的 Pod template 上 |
-| `node-exporter` | `kubernetes_sd_configs: node` + relabel | 把 node 地址改写到 `:9100`，对应 DaemonSet 的 hostPort |
-| `kube-state-metrics` | static | 走 Service DNS |
+| job | 目标数 | 发现方式 | 说明 |
+| --- | --- | --- | --- |
+| `prometheus` | 1 | static | 自身 |
+| `alertmanager` | 1 | static | 走 Service DNS |
+| `demo-api` | 2 | `kubernetes_sd_configs: pod` + 注解 | 依赖 `prometheus.io/scrape=true`、`prometheus.io/port=8080`、`prometheus.io/path=/metrics` |
+| `node-exporter` | 2 | `kubernetes_sd_configs: node` + relabel | 把 node 地址改写到 `:9100`，对应 DaemonSet 的 hostPort |
+| `kube-state-metrics` | 1 | static | 走 Service DNS |
+| `loki` | 1 | static | 日志管道自身健康 |
+| `kubelet-cadvisor` | 2 | `kubernetes_sd_configs: node` | 容器 CPU/内存/OOM，走 apiserver 代理 |
+| `kubelet` | 2 | `kubernetes_sd_configs: node` | kubelet 自身，含镜像拉取耗时 |
+
+**为什么 kubelet 两组走 apiserver 代理而不是直连 10250**：
+
+```yaml
+- target_label: __address__
+  replacement: 'kubernetes.default.svc:443'
+- source_labels: ['__meta_kubernetes_node_name']
+  target_label: __metrics_path__
+  replacement: '/api/v1/nodes/${1}/proxy/metrics/cadvisor'
+```
+
+不需要直连 kubelet 端口、不需要单独配 kubelet 证书（自签证书会让直连方式很麻烦），
+只需要 ServiceAccount 有 `nodes/proxy` 权限。
 
 没有安装 Prometheus Operator，因此没有 ServiceMonitor / PodMonitor。取舍：少 3 个 CRD 和一组 controller，
 代价是 relabel 规则要自己写；资源受限时这是更划算的选择。
 
-## 三、告警规则清单
+## 三、告警规则清单（20 条 / 4 组）
 
-| 告警 | 表达式要点 | for | 严重度 |
-| --- | --- | --- | --- |
-| `TargetDown` | `up == 0` | 1m | critical |
-| `DeploymentReplicasMismatch` | available < spec.replicas | 2m | critical |
-| `PodNotReady` | phase ∈ Pending/Unknown/Failed | 2m | warning |
-| `DemoApiHighErrorRate` | 5xx 占比 > 5% | 2m | critical |
-| `DemoApiHighLatencyP95` | `histogram_quantile(0.95, ...)` > 1s | 3m | warning |
-| `PodRestartTooOften` | 15m 内 `increase(restarts) > 3` | 1m | warning |
-| `ContainerOOMKilled` | `last_terminated_reason{reason="OOMKilled"} == 1` | 1m | critical |
-| `NodeMemoryPressure` | 内存使用 > 90% | 5m | warning |
-| `NodeDiskPressure` | 磁盘使用 > 85% | 5m | warning |
-| `NodeHighCPU` | CPU 使用 > 85% | 10m | info |
-| `LogCollectorDown` | fluent-bit 就绪数 < 期望数 | 5m | critical |
-| `LokiNotReceivingLogs` | Loki 15m 无日志写入 | 15m | warning |
-| `HPAMaxedOut` | current >= max replicas | 5m | warning |
-| `HPAUnableToScale` | AbleToScale 条件为 false | 5m | warning |
-| `PodCPUNearLimit` | CPU 使用 / limit > 85% | 5m | warning |
-| `PodMemoryNearLimit` | 内存使用 / limit > 90% | 5m | warning |
-| `PDBBlocksMaintenance` | ALLOWED DISRUPTIONS <= 0 | 30m | warning |
-| `PodImagePullFailed` | waiting_reason 为拉取错误 | 5m | critical |
-| `ImagePullSlow` | kubelet 拉取 P90 > 120s | 10m | warning |
+「验证」列如实标注——**没验证过的不假装验证过**。
+
+| 告警 | 组 | 表达式要点 | for | 严重度 | 验证 |
+| --- | --- | --- | --- | --- | --- |
+| `TargetDown` | availability | `up == 0` | 1m | critical | ✅ CrashLoop 演练 |
+| `DeploymentReplicasMismatch` | availability | available < spec.replicas | 2m | critical | ✅ OOM 演练 |
+| `PodNotReady` | availability | phase ∈ Pending/Unknown/Failed | 2m | warning | ⬜ 未单独构造 |
+| `PDBBlocksMaintenance` | availability | ALLOWED DISRUPTIONS <= 0 | 30m | warning | ⬜ 未构造（场景 11 可验证） |
+| `DemoApiHighErrorRate` | reliability | 5xx 占比 > 5% | 2m | critical | ✅ 注入 500 |
+| `DemoApiHighLatencyP95` | reliability | `histogram_quantile(0.95, ...)` > 1s | 3m | warning | ✅ 注入慢请求 |
+| `PodRestartTooOften` | reliability | 15m 内 `increase(restarts) > 3` | 1m | warning | ✅ CrashLoop 演练 |
+| `ContainerOOMKilled` | reliability | `reason{OOMKilled}==1` 且 1h 内 | 1m | critical | ✅ OOM 演练（含消解验证） |
+| `PodImagePullFailed` | reliability | `waiting_reason{ErrImagePull…}` | 5m | critical | ⬜ 未构造（场景 5 可验证） |
+| `ContainerOOMEvents` | reliability | cAdvisor OOM 计数增量 > 0 | — | critical | ⬜ 未触发，见下方说明 |
+| `ImagePullSlow` | capacity | kubelet 拉取 P90 > 120s | 10m | warning | ✅ 真实捕获 174s |
+| `NodeMemoryPressure` | capacity | 内存使用 > 90% | 5m | warning | ⬜ 未构造 |
+| `NodeDiskPressure` | capacity | 磁盘使用 > 85% | 5m | warning | ⬜ 未构造 |
+| `NodeHighCPU` | capacity | CPU 使用 > 85% | 10m | info | ✅ 压测时 pending |
+| `LogCollectorDown` | capacity | fluent-bit 就绪数 < 期望数 | 5m | critical | ⬜ 未构造（场景 10 可验证） |
+| `LokiNotReceivingLogs` | capacity | Loki 15m 无日志写入 | 15m | warning | ⬜ 未构造 |
+| `HPAMaxedOut` | autoscaling | current >= max replicas | 5m | warning | ⬜ 压测时长不足 |
+| `HPAUnableToScale` | autoscaling | AbleToScale 条件为 false | 5m | warning | ⬜ 未构造 |
+| `PodCPUNearLimit` | autoscaling | CPU 使用 / limit > 85% | 5m | warning | ⬜ CFS 限流下停在 74% |
+| `PodMemoryNearLimit` | autoscaling | 内存使用 / limit > 90% | 5m | warning | ⬜ 未构造 |
+
+**统计：8 条 ✅ 已验证，12 条 ⬜ 未验证。**
+
+### 未验证项的具体原因
+
+| 告警 | 为什么没验证成 |
+| --- | --- |
+| `ContainerOOMEvents` | 容器整体重启后 cAdvisor 计数器归零。它的价值在"worker 级 OOM 但容器不重启"（gunicorn 多 worker），该场景未构造出来 |
+| `HPAMaxedOut` | 压测只持续 6.5 分钟，当时 `for: 10m` 永远等不到（已改为 5m，但仍需重测） |
+| `PodCPUNearLimit` | 定 85%，但 CFS 限流让 Pod 稳定在 74%。更该看 `container_cpu_cfs_throttled_periods_total` |
+| `NodeMemoryPressure` / `NodeDiskPressure` | 构造会压垮 3.6 GiB 的 worker，风险大于收益 |
+| 其余 | 需要专门构造场景，优先用 `10-drill-lab.md` 的 11 个场景覆盖 |
+
+### kube-state-metrics 的白名单陷阱
+
+`--resources` 是**白名单**，不在列表里的资源完全不会产生指标，依赖它的告警会静默失效。
+当前白名单必须包含：
+
+```text
+pods,deployments,replicasets,statefulsets,daemonsets,nodes,namespaces,
+services,endpoints,persistentvolumes,persistentvolumeclaims,jobs,cronjobs,
+horizontalpodautoscalers,poddisruptionbudgets
+```
+
+项目曾因为没有后两项，导致 `HPAMaxedOut` / `HPAUnableToScale` 从写下的那一刻就是死的。
+
+**定期审计**（能发现"health=ok 但永远不会触发"的死告警）：
+
+```bash
+kubectl -n monitoring port-forward svc/prometheus 9090:9090 &
+python3 scripts/audit-alerts.py --url http://127.0.0.1:9090
+```
 | `ContainerOOMEvents` | cAdvisor OOM 计数增量 > 0 | — | critical |
 
 共 **20 条**，分 4 组：availability(4)、reliability(6)、capacity(6)、autoscaling(4)。
@@ -152,7 +203,18 @@ Alertmanager 侧：`severity=critical` 走 10s 的 `group_wait` 快通道，其�
 实验环境没有 SMTP 和外网回调，receiver 是 `blackhole`，**以 Alertmanager UI 的 Firing 列表作为送达证据**。
 接真实通道时把 `20-alertmanager.yaml` 里注释掉的 `webhook_configs` 打开即可。
 
-## 四、演练流程（每次都要留 RCA）
+## 四、演练流程（手工步骤）
+
+> **本节与 [`10-drill-lab.md`](10-drill-lab.md) 的分工**：
+> 这里是最初的 D1–D8 手工步骤，用来理解每个故障"怎么做出来、会触发什么"。
+> 想练**盲排**（只给现场证据、不给注入方式），用演练实验室的 11 个自动化场景：
+>
+> ```bash
+> ./scripts/drills/inject.sh list     # 看 11 个场景
+> ./scripts/drills/inject.sh 3        # 注入（不告诉你做了什么）
+> ./scripts/drills/collect.sh 3       # 采集 11 类现场证据
+> ./scripts/drills/recover.sh         # 恢复
+> ```
 
 统一模板：
 
@@ -217,24 +279,32 @@ kubectl -n sre-lab rollout undo deploy/demo-api
 
 ### D5 OOMKilled
 
-需要新镜像（`/simulate/memory` 端点是本次新增的）。先把应用重新发布一次：
+`/simulate/memory` 端点已随当前镜像发布，`ENABLE_FAULT_ENDPOINTS=1` 已在 `k8s/app.yaml` 开启。
+
+> **注意端点的实现细节**：早期版本写成
+> `chunks = [block for _ in range(mib)]`，那是对同一个 1MiB 对象的 mib 个引用，
+> **实际只占 1MiB，传多少都不会 OOM**。现在已改为逐个 `bytearray(1024*1024)`。
+> 如果发现"注入了但内存没涨"，先查这一点。
 
 ```bash
-# 1. 发布带 /simulate/memory 的新镜像（见 docs/4-next-phase-plan.md P1 流程）
-# 2. 临时压低内存 limit
+# 1. 临时压低内存 limit（requests 必须 <= limits，要一起改）
 kubectl -n sre-lab set resources deploy/demo-api --limits=memory=64Mi --requests=memory=64Mi
-# 3. 触发分配
+# 2. 触发分配
 kubectl -n sre-lab port-forward svc/demo-api 8080:80
 curl -i 'http://127.0.0.1:8080/simulate/memory?mib=256&hold=30'
-# 4. 观察
+# 3. 观察
 kubectl -n sre-lab get pods -w
 kubectl -n sre-lab describe pod <pod> | grep -A3 "Last State"
-# 5. 恢复
+# 4. 恢复
 kubectl -n sre-lab set resources deploy/demo-api --limits=memory=256Mi --requests=memory=128Mi
 ```
 
 预期告警：`ContainerOOMKilled` + `PodRestartTooOften`。
 `Last State: Terminated, Reason: OOMKilled, Exit Code: 137` 是标准证据。
+
+**注意 `ContainerOOMKilled` 的消解行为**：`last_terminated_reason` 是持久状态，
+所以表达式加了 1 小时时间窗（`time() - last_terminated_timestamp < 3600`）。
+不加时间窗的话，一次 OOM 之后会永久 firing——那比没有告警更糟。
 
 ### D6 慢请求与 P95 告警
 
@@ -286,8 +356,10 @@ kubectl delete -f k8s/namespace.yaml
 
 | 限制 | 后果 | 绕法 |
 | --- | --- | --- |
-| 没有 StorageClass，Prometheus / Grafana 用 emptyDir | Pod 重建后历史指标与 Grafana 手工改动丢失（看板来自 ConfigMap，不受影响） | 演练前用 `--storage.tsdb.retention.time=6h` 控制体积；长期化需要先补 local-path 或 NFS |
-| 没有 metrics-server | `kubectl top` 不可用，HPA 无法工作 | 集群资源看 Grafana 的节点面板，或临时装 metrics-server |
-| 镜像走 daocloud 代理 | 代理抖动会导致重新拉取失败 | 备用 `registry.cn-hangzhou.aliyuncs.com`；master 上已有镜像缓存，`imagePullPolicy: IfNotPresent` 时不受影响 |
+| 没有 StorageClass，Prometheus / Loki / Grafana 用 emptyDir | Pod 重建后历史指标与日志丢失（看板来自 ConfigMap，不受影响） | Prometheus 保留 6h/1GB，Loki 保留 24h；长期化需先补 local-path 或 NFS |
+| 镜像走 daocloud 代理 | 代理抖动会导致重新拉取失败 | 备用 `registry.cn-hangzhou.aliyuncs.com`；已用 `scripts/prewarm-image.sh` 把镜像预分发到所有节点 |
 | 工作节点仅 3.6 GiB | 监控栈不能放 node | 全部 `nodeSelector` 到 master |
-| 单副本监控 | 监控自身无高可用 | 实验环境可接受；面试时要主动说明这是取舍 |
+| 单副本监控 | 监控自身无高可用 | 实验环境可接受；面试时主动说明这是取舍 |
+| 只有 1 个 worker | 业务副本实际都在同一节点，跨节点容灾要至少 2 个 worker | `demo-api` 带 control-plane toleration 作兜底 |
+| Alertmanager receiver 是 `blackhole` | 告警不会真的发出 | 以 Alertmanager UI 的 Firing 列表作为送达证据；接真实通道打开 `20-alertmanager.yaml` 里注释掉的 `webhook_configs` |
+| 12 条告警未验证 | 无法证明它们在真实故障下会响 | 用演练实验室的 11 个场景逐个补；见 §三 的验证状态表 |

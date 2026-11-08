@@ -1,5 +1,9 @@
 # 集群盘点记录
 
+> **这是 2026-10-28 的初始基线，保留作历史对照。**
+> 现在集群里跑的东西远多于本文记录的内容（监控栈、日志栈、metrics-server、HPA 等）。
+> 想看当前状态请读 [`8-handoff.md`](8-handoff.md)。
+
 采集时间：2026-10-28，采集节点：master。
 
 ## 拓扑
@@ -11,7 +15,7 @@
 
 Kubernetes 版本：v1.34.1。两个节点均为 Ready。
 
-## 已安装组件
+## 已安装组件（2026-10-28 基线）
 
 - kube-apiserver、etcd、kube-controller-manager、kube-scheduler
 - CoreDNS，2 个副本
@@ -20,7 +24,7 @@ Kubernetes 版本：v1.34.1。两个节点均为 Ready。
 - 没有业务工作负载
 - 没有 PersistentVolume 或 PersistentVolumeClaim
 - 没有 StorageClass
-- 没有安装 metrics-server
+- 没有安装 metrics-server（**后于 P5 安装 v0.8.0**）
 
 ## 网络检查结论
 
@@ -35,16 +39,18 @@ Kubernetes 版本：v1.34.1。两个节点均为 Ready。
 
 工作节点只有约 3.6 GiB 内存，安装监控组件前必须检查 requests 和 limits，避免把节点压垮。
 
-## 当前缺口
+## 初始缺口（已于 P1–P7 补齐，保留作对照）
 
-- 还没有接入 CI/CD 流水线。
-- 还没有 Prometheus 告警规则和 Alertmanager 配置。
-- 示例应用镜像还没有构建。
-- 还没有做回滚演练。
-- 没有 Ingress Controller。
-- 没有 StorageClass。
-
-这些缺口是有意保留的，它们就是面试项目的下一阶段任务。
+| 缺口 | 状态 |
+| --- | --- |
+| 还没有接入 CI/CD 流水线 | ✅ P3 完成（SSH 经跳板机，待配 Secrets） |
+| 还没有 Prometheus 告警规则和 Alertmanager 配置 | ✅ P1 完成，现 20 条 |
+| 示例应用镜像还没有构建 | ✅ 完成 |
+| 还没有做回滚演练 | ✅ P2 完成（并发现 `rollout undo` 只回退一步的陷阱） |
+| 没有 metrics-server | ✅ P5 安装 v0.8.0 |
+| 没有日志集中收集 | ✅ P4 完成（Loki + Fluent Bit） |
+| 没有 Ingress Controller | ⬜ 仍未做，见 `8-handoff.md` §四 |
+| 没有 StorageClass | ⬜ 仍未做，是有意保留的实验环境限制 |
 
 ## 面试表述
 
